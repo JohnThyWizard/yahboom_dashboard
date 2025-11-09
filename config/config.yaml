@@ -1,0 +1,26 @@
+ros2:
+  topics:
+    camera: "/camera/color/image_raw"
+    lidar: "/scan"
+    odom: "/odom"
+    map: "/map"
+  
+recording:
+  storage_path: "recordings"
+  frame_format: "jpg"
+  metadata_format: "json"
+  sync_interval_ms: 100
+
+streaming:
+  image_quality: 85
+  max_fps: 30
+  websocket_port: 8765
+
+dashboard:
+  refresh_rate_ms: 100
+  max_history_hours: 24
+
+alerts:
+  enabled: true
+  anomaly_threshold: 0.7
+
