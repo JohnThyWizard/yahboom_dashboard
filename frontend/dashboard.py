@@ -2,6 +2,49 @@
 Yahboom Dashboard - Streamlit Frontend
 Real-Time Robotic Control & Replay System
 """
+# IMPORTANT: Configure logging BEFORE importing Streamlit
+import logging
+import warnings
+import sys
+
+# Suppress Streamlit media file storage warnings (harmless cache lookup errors)
+# These occur due to Streamlit's internal caching mechanism conflicting with rapid refreshes
+
+# Set logging levels before Streamlit initializes
+logging.getLogger('streamlit.runtime.media_file_storage').setLevel(logging.CRITICAL)
+logging.getLogger('streamlit.web.server.media_file_handler').setLevel(logging.CRITICAL)
+logging.getLogger('streamlit.runtime').setLevel(logging.ERROR)
+logging.getLogger('streamlit.web').setLevel(logging.ERROR)
+logging.getLogger('streamlit').setLevel(logging.ERROR)
+
+# Suppress Python warnings
+warnings.filterwarnings('ignore', category=UserWarning)
+warnings.filterwarnings('ignore', category=RuntimeWarning)
+
+# Create a filter to suppress MediaFileStorageError messages
+class MediaFileErrorFilter(logging.Filter):
+    def filter(self, record):
+        try:
+            msg = str(record.getMessage())
+            return not any([
+                'MediaFileStorageError' in msg,
+                'media_file_storage' in msg.lower(),
+                'media_file_handler' in msg.lower(),
+                'Bad filename' in msg,
+                'Missing file' in msg,
+                ('KeyError' in msg and 'media' in msg.lower())
+            ])
+        except:
+            return True
+
+# Apply filter to all relevant loggers
+for logger_name in ['streamlit', 'streamlit.runtime', 'streamlit.web', 'root']:
+    logger = logging.getLogger(logger_name if logger_name != 'root' else '')
+    logger.addFilter(MediaFileErrorFilter())
+    if logger_name != 'root':
+        logger.setLevel(logging.ERROR)
+
+# Now import Streamlit and other modules
 import streamlit as st
 import requests
 import json
@@ -114,13 +157,21 @@ def get_status() -> Optional[Dict]:
     return None
 
 
-def get_latest_camera_frame() -> Optional[Image.Image]:
-    """Get latest camera frame from backend"""
+def get_latest_camera_frame() -> Optional[np.ndarray]:
+    """Get latest camera frame from backend as numpy array"""
     try:
         response = requests.get(f"{BACKEND_URL}/api/camera/latest", timeout=2)
         if response.status_code == 200:
-            return Image.open(io.BytesIO(response.content))
-    except:
+            img = Image.open(io.BytesIO(response.content))
+            # Convert PIL Image to numpy array (RGB format)
+            # PIL images are RGB, numpy array will be (H, W, 3) with RGB channels
+            img_array = np.array(img)
+            # Ensure it's RGB (not RGBA)
+            if len(img_array.shape) == 3 and img_array.shape[2] == 4:
+                img_array = img_array[:, :, :3]  # Remove alpha channel if present
+            return img_array
+    except Exception as e:
+        # Silently fail - camera might not be available
         pass
     return None
 
@@ -187,13 +238,20 @@ def get_session_data(session_id: str) -> Optional[Dict]:
     return None
 
 
-def get_frame_from_session(session_id: str, frame_id: str) -> Optional[Image.Image]:
-    """Get a specific frame from a session"""
+def get_frame_from_session(session_id: str, frame_id: str) -> Optional[np.ndarray]:
+    """Get a specific frame from a session as numpy array"""
     try:
         response = requests.get(f"{BACKEND_URL}/api/recording/session/{session_id}/frame/{frame_id}", timeout=2)
         if response.status_code == 200:
-            return Image.open(io.BytesIO(response.content))
-    except:
+            img = Image.open(io.BytesIO(response.content))
+            # Convert PIL Image to numpy array (RGB format)
+            img_array = np.array(img)
+            # Ensure it's RGB (not RGBA)
+            if len(img_array.shape) == 3 and img_array.shape[2] == 4:
+                img_array = img_array[:, :, :3]  # Remove alpha channel if present
+            return img_array
+    except Exception as e:
+        # Silently fail - frame might not be available
         pass
     return None
 
@@ -302,6 +360,16 @@ if 'camera_enabled' not in st.session_state:
     st.session_state.camera_enabled = True
 if 'lidar_enabled' not in st.session_state:
     st.session_state.lidar_enabled = True
+if 'cached_session_data' not in st.session_state:
+    st.session_state.cached_session_data = {}
+if 'last_loaded_frame' not in st.session_state:
+    st.session_state.last_loaded_frame = None
+if 'cached_frames' not in st.session_state:
+    st.session_state.cached_frames = {}  # Cache loaded frame images
+if 'failed_frames' not in st.session_state:
+    st.session_state.failed_frames = set()  # Track frames that failed to load
+if 'enable_frame_cache' not in st.session_state:
+    st.session_state.enable_frame_cache = False  # Cache disabled by default to save memory
 
 
 # Main dashboard
@@ -332,13 +400,13 @@ with st.sidebar:
     
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("▶️ Start", disabled=recording_status, use_container_width=True):
+        if st.button("▶️ Start", disabled=recording_status, width='stretch'):
             if start_recording():
                 st.success("Recording started")
                 st.rerun()
     
     with col2:
-        if st.button("⏹️ Stop", disabled=not recording_status, use_container_width=True):
+        if st.button("⏹️ Stop", disabled=not recording_status, width='stretch'):
             if stop_recording():
                 st.success("Recording stopped")
                 st.rerun()
@@ -388,7 +456,27 @@ if st.session_state.playback_mode:
         )
         
         if selected_session_id:
-            session_data = get_session_data(selected_session_id)
+            # Cache session data to avoid reloading on every slider change
+            cache_key = f"session_{selected_session_id}"
+            if cache_key not in st.session_state.cached_session_data:
+                session_data = get_session_data(selected_session_id)
+                if session_data:
+                    st.session_state.cached_session_data[cache_key] = session_data
+                else:
+                    st.error("Could not load session data")
+                    st.stop()
+            else:
+                session_data = st.session_state.cached_session_data[cache_key]
+            
+            # Reset frame index if session changed
+            if st.session_state.selected_session != selected_session_id:
+                st.session_state.current_frame_idx = 0
+                st.session_state.selected_session = selected_session_id
+                st.session_state.last_loaded_frame = None
+                # Always clear cache when session changes (especially if caching disabled)
+                st.session_state.cached_frames = {}
+                st.session_state.failed_frames = set()
+            
             if session_data and 'frames' in session_data:
                 frames = session_data['frames']
                 
@@ -396,6 +484,29 @@ if st.session_state.playback_mode:
                     # Timeline scrubber
                     st.subheader("⏱️ Timeline")
                     max_idx = len(frames) - 1
+                    
+                    # Controls
+                    col_reset, col_cache, col_info = st.columns([1, 1, 2])
+                    with col_reset:
+                        if st.button("🔄 Reset", help="Reset to first frame and clear cache"):
+                            st.session_state.current_frame_idx = 0
+                            st.session_state.last_loaded_frame = None
+                            st.session_state.cached_frames = {}  # Clear frame cache
+                            st.session_state.failed_frames = set()  # Clear failed frames
+                            st.rerun()
+                    with col_cache:
+                        cache_enabled = st.checkbox(
+                            "💾 Cache Frames", 
+                            value=st.session_state.enable_frame_cache,
+                            help="Enable frame caching (uses more memory but faster navigation)"
+                        )
+                        if cache_enabled != st.session_state.enable_frame_cache:
+                            st.session_state.enable_frame_cache = cache_enabled
+                            if not cache_enabled:
+                                # Clear cache when disabling
+                                st.session_state.cached_frames = {}
+                            st.rerun()
+                    
                     frame_idx = st.slider(
                         "Frame",
                         0,
@@ -408,11 +519,14 @@ if st.session_state.playback_mode:
                     # Frame info
                     current_frame = frames[frame_idx]
                     frame_time = datetime.fromtimestamp(current_frame['timestamp'])
-                    st.markdown(f"**Timestamp:** `{frame_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}`")
+                    st.markdown(f"**Timestamp:** `{frame_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}` | **Frame:** {frame_idx + 1}/{len(frames)}")
                     
                     # Alert indicator
                     if current_frame.get('alert'):
                         st.warning("⚠️ Alert detected at this frame")
+                    
+                    # Only reload frames if frame index changed
+                    frame_changed = (st.session_state.last_loaded_frame != frame_idx)
                     
                     # Display frame
                     col1, col2 = st.columns(2)
@@ -421,28 +535,90 @@ if st.session_state.playback_mode:
                         if st.session_state.camera_enabled:
                             st.subheader("📷 Camera Feed")
                             frame_id = current_frame['frame_id']
-                            frame_img = get_frame_from_session(selected_session_id, frame_id)
-                            if frame_img:
-                                st.image(frame_img, use_container_width=True)
-                            else:
-                                st.error("Frame not available")
+                            
+                            # Use placeholder to avoid re-rendering if frame hasn't changed
+                            camera_placeholder = st.empty()
+                            
+                            # Check if caching is enabled
+                            frame_cache_key = f"{selected_session_id}_{frame_id}"
+                            frame_img = None
+                            
+                            # Only use cache if caching is enabled
+                            if st.session_state.enable_frame_cache:
+                                if frame_cache_key in st.session_state.cached_frames:
+                                    # Use cached frame
+                                    try:
+                                        frame_img = st.session_state.cached_frames[frame_cache_key]
+                                        if frame_img is not None:
+                                            camera_placeholder.image(frame_img, width='stretch')
+                                        else:
+                                            # Cached frame is None, remove from cache and reload
+                                            del st.session_state.cached_frames[frame_cache_key]
+                                            frame_img = None
+                                    except Exception:
+                                        # If cached frame is invalid, remove it and reload
+                                        if frame_cache_key in st.session_state.cached_frames:
+                                            del st.session_state.cached_frames[frame_cache_key]
+                                        frame_img = None
+                            
+                            # Load frame if not cached or cache disabled
+                            if frame_img is None:
+                                # Skip if this frame recently failed (avoid spam)
+                                if frame_cache_key not in st.session_state.failed_frames:
+                                    try:
+                                        frame_img = get_frame_from_session(selected_session_id, frame_id)
+                                        if frame_img is not None:
+                                            # Successfully loaded
+                                            camera_placeholder.image(frame_img, width='stretch')
+                                            st.session_state.last_loaded_frame = frame_idx
+                                            # Only cache if caching is enabled
+                                            if st.session_state.enable_frame_cache:
+                                                st.session_state.cached_frames[frame_cache_key] = frame_img
+                                            # Remove from failed set if it was there
+                                            st.session_state.failed_frames.discard(frame_cache_key)
+                                        else:
+                                            # Frame not available
+                                            camera_placeholder.warning(f"⚠️ Frame {frame_id} not available")
+                                            st.session_state.failed_frames.add(frame_cache_key)
+                                    except Exception as e:
+                                        # Error loading - show error
+                                        error_msg = str(e)[:100] if len(str(e)) > 100 else str(e)
+                                        camera_placeholder.warning(f"⚠️ Error: {error_msg}")
+                                        st.session_state.failed_frames.add(frame_cache_key)
+                                        # Reset last_loaded_frame to allow retry on next change
+                                        if st.session_state.last_loaded_frame == frame_idx:
+                                            st.session_state.last_loaded_frame = None
+                                else:
+                                    # Frame previously failed - show message but allow manual retry
+                                    if st.button("🔄 Retry", key=f"retry_{frame_cache_key}"):
+                                        st.session_state.failed_frames.discard(frame_cache_key)
+                                        if st.session_state.enable_frame_cache:
+                                            st.session_state.cached_frames.pop(frame_cache_key, None)
+                                        st.rerun()
+                                    else:
+                                        camera_placeholder.warning("⚠️ Frame failed to load. Click Retry to try again.")
                         else:
                             st.info("Camera feed disabled")
                     
                     with col2:
                         if st.session_state.lidar_enabled:
                             st.subheader("📡 LiDAR/SLAM Map")
-                            # Load LiDAR data from frame
-                            frame_id = current_frame['frame_id']
-                            lidar_data = get_lidar_from_session(selected_session_id, frame_id)
-                            if lidar_data:
-                                fig = visualize_lidar(lidar_data)
-                                if fig:
-                                    st.plotly_chart(fig, use_container_width=True)
+                            lidar_placeholder = st.empty()
+                            
+                            try:
+                                # Load LiDAR data from frame
+                                frame_id = current_frame['frame_id']
+                                lidar_data = get_lidar_from_session(selected_session_id, frame_id)
+                                if lidar_data:
+                                    fig = visualize_lidar(lidar_data)
+                                    if fig:
+                                        lidar_placeholder.plotly_chart(fig, width='stretch')
+                                    else:
+                                        lidar_placeholder.warning("Could not visualize LiDAR data")
                                 else:
-                                    st.warning("Could not visualize LiDAR data")
-                            else:
-                                st.warning("No LiDAR data for this frame")
+                                    lidar_placeholder.warning("No LiDAR data for this frame")
+                            except Exception as e:
+                                lidar_placeholder.error(f"Error loading LiDAR: {str(e)}")
                         else:
                             st.info("LiDAR map disabled")
                 else:
@@ -482,8 +658,8 @@ else:
             
             # Get and display latest frame
             camera_frame = get_latest_camera_frame()
-            if camera_frame:
-                camera_placeholder.image(camera_frame, use_container_width=True)
+            if camera_frame is not None:
+                camera_placeholder.image(camera_frame, width='stretch')
                 # Timestamp overlay
                 if status:
                     st.caption(f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}")
@@ -502,7 +678,7 @@ else:
             if lidar_data:
                 fig = visualize_lidar(lidar_data)
                 if fig:
-                    lidar_placeholder.plotly_chart(fig, use_container_width=True)
+                    lidar_placeholder.plotly_chart(fig, width='stretch')
                 else:
                     lidar_placeholder.warning("⚠️ Could not visualize LiDAR data")
             else:

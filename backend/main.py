@@ -5,6 +5,7 @@ import rclpy
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
 import cv2
 import json
 import yaml
@@ -17,8 +18,116 @@ import time
 
 from ros2_bridge import ROS2Bridge
 from recorder import DataRecorder
+from camera_node import CameraNode
 
-app = FastAPI(title="Yahboom Dashboard API")
+# Global state
+ros2_bridge: Optional[ROS2Bridge] = None
+camera_node: Optional[CameraNode] = None
+recorder: Optional[DataRecorder] = None
+config: dict = {}
+
+
+def load_config():
+    """Load configuration from YAML file"""
+    config_path = Path(__file__).parent.parent / 'config' / 'config.yaml'
+    with open(config_path, 'r') as f:
+        return yaml.safe_load(f)
+
+
+def init_ros2():
+    """Initialize ROS2 node"""
+    global ros2_bridge, camera_node
+    if not rclpy.ok():
+        rclpy.init()
+    
+    # Initialize camera node if enabled
+    if config.get('camera', {}).get('enabled', False):
+        if camera_node is None:
+            try:
+                camera_node = CameraNode(config)
+            except Exception as e:
+                print(f"Warning: Could not initialize camera node: {e}")
+                camera_node = None
+    
+    if ros2_bridge is None:
+        ros2_bridge = ROS2Bridge(config)
+        
+        # Start ROS2 executor in background thread
+        def spin_ros2():
+            executor = rclpy.executors.SingleThreadedExecutor()
+            executor.add_node(ros2_bridge)
+            # Add camera node to executor if it exists
+            if camera_node:
+                executor.add_node(camera_node)
+            try:
+                executor.spin()
+            except KeyboardInterrupt:
+                pass
+        
+        ros2_thread = threading.Thread(target=spin_ros2, daemon=True)
+        ros2_thread.start()
+
+
+async def recording_task():
+    """Background task to record frames periodically"""
+    global config, recorder, ros2_bridge
+    
+    while True:
+        try:
+            if config:
+                sync_interval = config.get('recording', {}).get('sync_interval_ms', 100) / 1000.0
+            else:
+                sync_interval = 0.1
+            
+            if recorder and recorder.is_recording and ros2_bridge:
+                frame, timestamp = ros2_bridge.get_latest_camera_frame()
+                lidar_data, _ = ros2_bridge.get_latest_lidar_data()
+                odom_data, _ = ros2_bridge.get_latest_odom()
+                
+                if frame is not None:
+                    recorder.record_frame(frame, lidar_data, odom_data, timestamp)
+            
+            await asyncio.sleep(sync_interval)
+        except Exception as e:
+            print(f"Recording task error: {e}")
+            await asyncio.sleep(1.0)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager for startup and shutdown"""
+    # Startup
+    global config, recorder
+    config = load_config()
+    recorder = DataRecorder(
+        config['recording']['storage_path'],
+        config
+    )
+    init_ros2()
+    
+    # Start background recording task
+    recording_task_handle = asyncio.create_task(recording_task())
+    
+    yield
+    
+    # Shutdown (cleanup if needed)
+    recording_task_handle.cancel()
+    try:
+        await recording_task_handle
+    except asyncio.CancelledError:
+        pass
+    
+    global camera_node
+    if camera_node:
+        camera_node.stop_camera()
+        camera_node.destroy_node()
+    if ros2_bridge:
+        ros2_bridge.destroy_node()
+    if rclpy.ok():
+        rclpy.shutdown()
+
+
+app = FastAPI(title="Yahboom Dashboard API", lifespan=lifespan)
 
 # CORS middleware
 app.add_middleware(
@@ -33,47 +142,6 @@ app.add_middleware(
 ros2_bridge: Optional[ROS2Bridge] = None
 recorder: Optional[DataRecorder] = None
 config: dict = {}
-
-
-def load_config():
-    """Load configuration from YAML file"""
-    config_path = Path(__file__).parent.parent / 'config' / 'config.yaml'
-    with open(config_path, 'r') as f:
-        return yaml.safe_load(f)
-
-
-def init_ros2():
-    """Initialize ROS2 node"""
-    global ros2_bridge
-    if not rclpy.ok():
-        rclpy.init()
-    
-    if ros2_bridge is None:
-        ros2_bridge = ROS2Bridge(config)
-        
-        # Start ROS2 executor in background thread
-        def spin_ros2():
-            executor = rclpy.executors.SingleThreadedExecutor()
-            executor.add_node(ros2_bridge)
-            try:
-                executor.spin()
-            except KeyboardInterrupt:
-                pass
-        
-        ros2_thread = threading.Thread(target=spin_ros2, daemon=True)
-        ros2_thread.start()
-
-
-@app.on_event("startup")
-async def startup_event():
-    """Initialize services on startup"""
-    global config, recorder
-    config = load_config()
-    recorder = DataRecorder(
-        config['recording']['storage_path'],
-        config
-    )
-    init_ros2()
 
 
 @app.get("/")

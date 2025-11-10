@@ -1,9 +1,16 @@
 ros2:
   topics:
-    camera: "/camera/color/image_raw"
+    camera: "/camera/image_raw"
     lidar: "/scan"
     odom: "/odom"
     map: "/map"
+
+camera:
+  enabled: true
+  device: "/dev/video0"
+  width: 640
+  height: 480
+  fps: 30
   
 recording:
   storage_path: "recordings"
