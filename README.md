@@ -39,7 +39,7 @@ Main branch doesn't work see tags for what you need:
 ```bash
 
 # Create venv
-pip -m venv streamlit-venv
+python3 -m venv streamlit-venv
 
 # Source venv
 source streamlit-venv/bin/activate
