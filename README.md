@@ -1,8 +1,15 @@
-# Yahboom Dashboard
+# Yahboom Dashboard (READ DISCLAIMER)
 
 Real-Time Robotic Control & Replay System
 
 A unified, AI-assisted robotic monitoring and control system designed to provide real-time situational awareness, historical replay, and intelligent event logging for mobile robots running ROS2.
+
+## DISCLAIMER
+
+Main branch doesn't work see tags for what you need:
+- **v1.0.0**: almost not working
+- **v1.1.0**: working server and frontend same pc
+- **v1.2.0**: working for same and different pc
 
 ## Features
 
@@ -30,6 +37,13 @@ A unified, AI-assisted robotic monitoring and control system designed to provide
 ## Quick Start
 
 ```bash
+
+# Create venv
+pip -m venv streamlit-venv
+
+# Source venv
+source streamlit-venv/bin/activate
+
 # Install dependencies
 pip install -r requirements.txt
 
@@ -37,7 +51,7 @@ pip install -r requirements.txt
 source /opt/ros/humble/setup.bash  # Adjust for your ROS2 distribution
 
 # Terminal 1: Run the backend
-python backend/main.py
+python backend/app.py
 
 # Terminal 2: Run the frontend
 streamlit run frontend/dashboard.py
@@ -47,11 +61,12 @@ streamlit run frontend/dashboard.py
 
 ## Usage
 
-1. Start the FastAPI backend to begin ROS2 topic subscription
-2. Launch the Streamlit dashboard
-3. Toggle recording to start capturing data
-4. Use timeline scrubber to navigate recorded frames
-5. Switch between live and replay modes seamlessly
+1. Source the streamlit-venv and ros2
+2. Start the FastAPI backend to begin ROS2 topic subscription
+3. Launch the Streamlit dashboard
+4. Toggle recording to start capturing data
+5. Use timeline scrubber to navigate recorded frames
+6. Switch between live and replay modes seamlessly
 
 ## Configuration
 
