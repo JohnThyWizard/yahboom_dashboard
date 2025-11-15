@@ -75,6 +75,3 @@ htmlcov/
 
 # ZIPS
 *.zip
-
-# OTHER
-mqtt-camera-streamer/
