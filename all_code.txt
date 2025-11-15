@@ -1,0 +1,4718 @@
+# ========== ./backend/__init__.py ==========
+# Backend package for Yahboom Dashboard
+
+
+# ========== ./backend/ros2_bridge.py ==========
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import Image, LaserScan
+from nav_msgs.msg import Odometry, OccupancyGrid
+from cv_bridge import CvBridge
+import numpy as np
+import cv2
+import threading
+from typing import Optional, Tuple, Dict, Any, List
+
+class ROS2Bridge(Node):
+    """
+    A communication bridge for connecting the FastAPI backend to ROS 2 topics.
+    Subscribes to sensor data and provides the latest data via thread-safe accessors.
+    """
+
+    def __init__(self, config: Dict[str, Any]):
+        super().__init__('fastapi_ros2_bridge')
+        self.bridge = CvBridge()
+        
+        # --- Latest Data Storage (Thread-safe) ---
+        self._latest_camera_frame: Optional[np.ndarray] = None
+        self._latest_camera_timestamp: Optional[float] = None
+        self._latest_lidar_data: Optional[Dict[str, Any]] = None
+        self._latest_odom_data: Optional[Dict[str, Any]] = None
+        self._latest_map_data: Optional[Dict[str, Any]] = None
+        self._data_lock = threading.Lock()
+
+        # ❗ CRITICAL FIX: Read topics from the nested 'ros2:topics' structure
+        ros2_topics = config.get('ros2', {}).get('topics', {})
+        camera_topic = ros2_topics.get('camera', '/camera/raw_image') # Gets "/camera/image_raw"
+        lidar_topic = ros2_topics.get('lidar', '/scan')
+        odom_topic = ros2_topics.get('odom', '/odom')
+        map_topic = ros2_topics.get('map', '/map')
+
+        # --- Subscriptions ---
+        # 1. Camera Subscription (Now uses the configured topic)
+        self.camera_sub = self.create_subscription(
+            Image,
+            camera_topic,
+            self.camera_callback,
+            10
+        )
+        self.get_logger().info(f'Subscribed to camera topic: {camera_topic}')
+
+        # 2. LiDAR Subscription
+        self.lidar_sub = self.create_subscription(
+            LaserScan,
+            lidar_topic,
+            self.lidar_callback,
+            10
+        )
+        self.get_logger().info(f'Subscribed to lidar topic: {lidar_topic}')
+
+        # 3. Odometry Subscription
+        self.odom_sub = self.create_subscription(
+            Odometry,
+            odom_topic,
+            self.odom_callback,
+            10
+        )
+        self.get_logger().info(f'Subscribed to odometry topic: {odom_topic}')
+        
+        # 4. Map Subscription
+        self.map_sub = self.create_subscription(
+            OccupancyGrid,
+            map_topic,
+            self.map_callback,
+            1 # QoS=1 for static maps
+        )
+        self.get_logger().info(f'Subscribed to map topic: {map_topic}')
+
+    # --- Callbacks ---
+
+    def camera_callback(self, msg: Image):
+        """Converts ROS Image message to OpenCV (numpy array)."""
+        try:
+            cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+            timestamp = msg.header.stamp.sec + msg.header.stamp.nanosec / 1e9
+            
+            with self._data_lock:
+                self._latest_camera_frame = cv_image
+                self._latest_camera_timestamp = timestamp
+        except Exception as e:
+            self.get_logger().error(f"Camera frame conversion error: {e}")
+
+    def lidar_callback(self, msg: LaserScan):
+        """Processes ROS LaserScan message."""
+        data = {
+            'ranges': [float(r) for r in msg.ranges],
+            'angles': [msg.angle_min + i * msg.angle_increment for i in range(len(msg.ranges))],
+            'range_min': msg.range_min,
+            'range_max': msg.range_max,
+            'timestamp': msg.header.stamp.sec + msg.header.stamp.nanosec / 1e9
+        }
+        with self._data_lock:
+            self._latest_lidar_data = data
+            
+    def odom_callback(self, msg: Odometry):
+        """Processes ROS Odometry message."""
+        data = {
+            'position': {
+                'x': msg.pose.pose.position.x,
+                'y': msg.pose.pose.position.y,
+                'z': msg.pose.pose.position.z,
+            },
+            'linear_velocity': {
+                'x': msg.twist.twist.linear.x,
+                'y': msg.twist.twist.linear.y,
+                'z': msg.twist.twist.linear.z,
+            },
+            'timestamp': msg.header.stamp.sec + msg.header.stamp.nanosec / 1e9
+        }
+        with self._data_lock:
+            self._latest_odom_data = data
+            
+    def map_callback(self, msg: OccupancyGrid):
+        """Processes ROS OccupancyGrid message."""
+        data = {
+            'width': msg.info.width,
+            'height': msg.info.height,
+            'resolution': msg.info.resolution,
+            'origin': {
+                'x': msg.info.origin.position.x,
+                'y': msg.info.origin.position.y,
+                'z': msg.info.origin.position.z,
+            },
+            # Convert tuple/list to list of integers for JSON serialization
+            'data': list(msg.data), 
+            'timestamp': msg.header.stamp.sec + msg.header.stamp.nanosec / 1e9
+        }
+        with self._data_lock:
+            self._latest_map_data = data
+
+    # --- Public Accessors for Backend ---
+
+    def get_latest_camera_frame(self) -> Tuple[Optional[np.ndarray], Optional[float]]:
+        """Returns the latest frame and its timestamp, WITHOUT clearing the buffer."""
+        with self._data_lock:
+            frame = self._latest_camera_frame
+            timestamp = self._latest_camera_timestamp
+            
+            # ❌ REMOVE THESE TWO LINES:
+            # self._latest_camera_frame = None 
+            # self._latest_camera_timestamp = None
+            
+            return frame, timestamp
+
+    def get_latest_lidar_data(self) -> Tuple[Optional[Dict[str, Any]], Optional[float]]:
+        """Returns the latest LiDAR data and its timestamp."""
+        with self._data_lock:
+            data = self._latest_lidar_data
+            timestamp = data.get('timestamp') if data else None
+            return data, timestamp
+
+    def get_latest_odom(self) -> Tuple[Optional[Dict[str, Any]], Optional[float]]:
+        """Returns the latest odometry data and its timestamp."""
+        with self._data_lock:
+            data = self._latest_odom_data
+            timestamp = data.get('timestamp') if data else None
+            return data, timestamp
+            
+    def get_latest_map(self) -> Optional[Dict[str, Any]]:
+        """Returns the latest map data."""
+        with self._data_lock:
+            return self._latest_map_data
+            
+    # --- Status/Peek Accessors (for /api/status endpoint) ---
+
+    @property
+    def latest_camera_frame(self) -> Optional[np.ndarray]:
+        """Peeks at the latest camera frame without clearing the buffer."""
+        with self._data_lock:
+            return self._latest_camera_frame
+
+    @property
+    def latest_lidar_data(self) -> Optional[Dict[str, Any]]:
+        """Peeks at the latest LiDAR data."""
+        with self._data_lock:
+            return self._latest_lidar_data
+
+    @property
+    def latest_map(self) -> Optional[Dict[str, Any]]:
+        """Peeks at the latest map data."""
+        with self._data_lock:
+            return self._latest_map_data
+# ========== ./backend/backup/app.py ==========
+"""
+FastAPI Backend - Main server for Yahboom Dashboard
+"""
+import rclpy
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
+import cv2
+import json
+import yaml
+import asyncio
+from pathlib import Path
+import base64
+from typing import Optional, Dict, Any
+import threading
+import time
+import io
+import os 
+
+import numpy as np
+from PIL import Image
+
+# Local Imports (Assuming these are in the same directory structure)
+from ros2_bridge import ROS2Bridge
+from fast_recorder_integrated import FastRecorder, create_video_from_session
+from camera_node import CameraNode 
+
+# --- Global State ---
+ros2_bridge: Optional[ROS2Bridge] = None
+camera_node: Optional[CameraNode] = None
+recorder: Optional[FastRecorder] = None
+config: dict = {}
+recording_fps: float = 10.0  
+# Cache for the latest data sent over the WebSocket for Streamlit polling
+latest_stream_cache: Dict[str, Any] = {}
+
+
+# --- Helper Functions ---
+
+def load_config():
+    """Load configuration from YAML file (Requires a config/config.yaml file)"""
+    config_path = Path(__file__).parent.parent / 'config' / 'config.yaml'
+    
+    # Fallback to an empty dict if config file isn't found
+    if not config_path.exists():
+        print("Warning: config/config.yaml not found. Using default settings.")
+        return {
+            "camera": {"enabled": True, "video_source": 0, "fps": 15},
+            "streaming": {"max_fps": 10.0, "image_quality": 85},
+            "recording": {"storage_path": "recordings", "sync_interval_ms": 100}
+        }
+
+    with open(config_path, 'r') as f:
+        return yaml.safe_load(f)
+
+
+def init_ros2():
+    """Initialize ROS2 node and start executor in background thread"""
+    global ros2_bridge, camera_node
+    if not rclpy.ok():
+        rclpy.init()
+    
+    # Initialize camera node if enabled
+    if config.get('camera', {}).get('enabled', False):
+        if camera_node is None:
+            try:
+                # CameraNode now takes the full config
+                camera_node = CameraNode(config) 
+            except Exception as e:
+                print(f"Warning: Could not initialize camera node: {e}")
+                camera_node = None
+    
+    # Initialize ROS2 bridge
+    if ros2_bridge is None:
+        ros2_bridge = ROS2Bridge(config)
+        
+        # Start ROS2 executor in background thread
+        def spin_ros2():
+            executor = rclpy.executors.SingleThreadedExecutor()
+            executor.add_node(ros2_bridge)
+            # Add camera node to executor if it exists
+            if camera_node:
+                executor.add_node(camera_node)
+            try:
+                executor.spin()
+            except KeyboardInterrupt:
+                pass
+            except Exception as e:
+                print(f"ROS 2 Executor error: {e}")
+        
+        ros2_thread = threading.Thread(target=spin_ros2, daemon=True)
+        ros2_thread.start()
+
+
+# ❗ CRITICAL CHANGE: The conflicting 'async def recording_task()' function is removed.
+# Recording is now handled inside the websocket_endpoint loop.
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager for startup and shutdown"""
+    # Startup
+    global config, recorder
+    config = load_config()
+    
+    # Initialize FastRecorder with storage path from config
+    storage_path = config.get('recording', {}).get('storage_path', 'recordings')
+    recorder = FastRecorder(storage_path=storage_path)
+    print(f"[FastRecorder] Initialized with storage: {storage_path}")
+    
+    # Initialize ROS 2 bridge and nodes
+    init_ros2()
+    
+    # ❗ CRITICAL CHANGE: Removed: recording_task_handle = asyncio.create_task(recording_task())
+    
+    print("FastAPI startup complete. ROS 2 and Recorder initialized.")
+    yield
+    
+    # Shutdown
+    # ❗ CRITICAL CHANGE: Removed cancellation for recording_task_handle
+    
+    global camera_node
+    if camera_node:
+        camera_node.stop_camera()
+        camera_node.destroy_node()
+    if ros2_bridge:
+        ros2_bridge.destroy_node()
+    if rclpy.ok():
+        rclpy.shutdown()
+    
+    print("FastAPI shutdown complete.")
+
+
+app = FastAPI(title="Yahboom Dashboard API", lifespan=lifespan)
+
+# CORS middleware
+origins = ["*"]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# --- REST Endpoints ---
+
+@app.get("/")
+async def root():
+    """Health check endpoint"""
+    return {"status": "online", "service": "yahboom_dashboard"}
+
+
+@app.get("/api/status")
+async def get_status():
+    """Get current system status"""
+    recording_info = recorder.get_recording_status() if recorder else None
+
+    # Use peek properties for status checks
+    cam_active = ros2_bridge.latest_camera_frame is not None if ros2_bridge else False
+    lidar_active = ros2_bridge.latest_lidar_data is not None if ros2_bridge else False
+    map_active = ros2_bridge.latest_map is not None if ros2_bridge else False
+    
+    return {
+        "ros2_connected": ros2_bridge is not None,
+        "recording": recorder.is_recording if recorder else False,
+        "recording_session": recording_info,
+        "camera_available": cam_active,
+        "lidar_available": lidar_active,
+        "map_available": map_active
+    }
+
+
+# The original /api/camera/latest, /api/lidar/latest, /api/odom/latest are now redundant 
+# for the Streamlit frontend because of the new /api/latest_stream_data endpoint, 
+# but we keep them for direct API access and to match the template structure.
+
+@app.get("/api/camera/latest")
+async def get_latest_camera():
+    """Get latest camera frame as JPEG"""
+    if not ros2_bridge:
+        return JSONResponse({"error": "ROS2 not initialized"}, status_code=503)
+    
+    # Use get_latest_camera_frame() which clears the frame
+    frame, timestamp = ros2_bridge.get_latest_camera_frame() 
+    if frame is None:
+        return JSONResponse({"error": "No camera data available"}, status_code=404)
+    
+    # Encode as JPEG
+    quality = config.get('streaming', {}).get('image_quality', 85)
+    _, buffer = cv2.imencode('.jpg', frame, 
+                            [cv2.IMWRITE_JPEG_QUALITY, quality])
+    
+    return StreamingResponse(
+        iter([buffer.tobytes()]),
+        media_type="image/jpeg",
+        headers={"X-Timestamp": str(timestamp)}
+    )
+
+# ... (other REST endpoints like /api/lidar/latest, /api/map/latest, /api/odom/latest remain as in your template) ...
+
+@app.get("/api/map/latest")
+async def get_latest_map():
+    """Get latest occupancy grid map rendered as PNG"""
+    if not ros2_bridge:
+        return JSONResponse({"error": "ROS2 not initialized"}, status_code=503)
+    
+    map_data = ros2_bridge.get_latest_map()
+    if map_data is None:
+        return JSONResponse({"error": "No map data available"}, status_code=404)
+    
+    try:
+        width = map_data['width']
+        height = map_data['height']
+        # Ensure data is treated as numpy array
+        data = np.array(map_data['data'], dtype=np.int8) 
+        if data.size != width * height:
+            return JSONResponse({"error": "Invalid map data size"}, status_code=500)
+        
+        grid = data.reshape((height, width))
+        
+        # Create RGB image: free (0) -> white, occupied (> 50) -> black, unknown (-1) -> gray
+        image = np.zeros((height, width, 3), dtype=np.uint8)
+        image[:] = (127, 127, 127)  # Unknown default (Gray)
+        
+        free_mask = grid == 0
+        occ_mask = grid > 50
+        
+        image[free_mask] = (220, 220, 220) # White/Light Gray
+        image[occ_mask] = (0, 0, 0) # Black
+        
+        # Flip vertically so origin matches typical SLAM conventions
+        image = np.flipud(image)
+        
+        pil_image = Image.fromarray(image)
+        buffer = io.BytesIO()
+        pil_image.save(buffer, format="PNG")
+        
+        encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
+        
+        return {
+            "map": {
+                "width": width,
+                "height": height,
+                "resolution": map_data.get("resolution"),
+                "origin": map_data.get("origin"),
+                "timestamp": map_data.get("timestamp"),
+                "image": encoded
+            }
+        }
+    except Exception as e:
+        return JSONResponse({"error": f"Map processing error: {str(e)}"}, status_code=500)
+
+
+# --- Recording Endpoints ---
+
+@app.post("/api/recording/start")
+async def start_recording():
+    """Start recording session"""
+    if not recorder:
+        return JSONResponse({"error": "Recorder not initialized"}, status_code=503)
+    
+    session_id = recorder.start_recording() 
+    return {"session_id": session_id, "status": "recording"}
+
+
+@app.post("/api/recording/stop")
+async def stop_recording():
+    """Stop recording session"""
+    if not recorder:
+        return JSONResponse({"error": "Recorder not initialized"}, status_code=503)
+    
+    if not recorder.is_recording:
+        return JSONResponse({"error": "Not recording"}, status_code=400)
+    
+    summary = recorder.stop_recording()
+    return summary
+
+
+@app.get("/api/recording/status")
+async def get_recording_status():
+    """Get current recording status"""
+    if not recorder:
+        return JSONResponse({"error": "Recorder not initialized"}, status_code=503)
+    
+    return recorder.get_recording_status()
+
+
+@app.get("/api/recording/sessions")
+async def get_sessions():
+    """Get list of all recorded sessions"""
+    if not recorder:
+        return JSONResponse({"error": "Recorder not initialized"}, status_code=503)
+    
+    sessions = recorder.get_sessions()
+    return {"sessions": sessions}
+
+
+@app.get("/api/recording/session/{session_id}")
+async def get_session(session_id: str):
+    """Get metadata for a specific session"""
+    if not recorder:
+        return JSONResponse({"error": "Recorder not initialized"}, status_code=503)
+    
+    metadata = recorder.get_session_metadata(session_id)
+    
+    if not metadata:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    
+    return metadata
+
+
+@app.post("/api/recording/alert")
+async def add_alert(alert_data: dict):
+    """Add alert to current recording"""
+    if not recorder:
+        return JSONResponse({"error": "Recorder not initialized"}, status_code=503)
+    
+    if not recorder.is_recording:
+        return JSONResponse({"error": "Not recording"}, status_code=400)
+    
+    try:
+        alert = recorder.add_alert(
+            alert_type=alert_data.get('type', 'manual'),
+            description=alert_data.get('description', ''),
+            metadata=alert_data.get('metadata', {})
+        )
+        return {"success": True, "alert": alert}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/recording/session/{session_id}/alerts")
+async def get_session_alerts(session_id: str):
+    """Get alerts for a session"""
+    if not recorder:
+        return JSONResponse({"error": "Recorder not initialized"}, status_code=503)
+    
+    metadata = recorder.get_session_metadata(session_id)
+    
+    if not metadata:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    
+    return {"alerts": metadata.get('alerts', [])}
+
+
+@app.post("/api/recording/session/{session_id}/create_video")
+async def create_session_video(session_id: str, video_params: dict = None):
+    """Create video from session"""
+    if not recorder:
+        return JSONResponse({"error": "Recorder not initialized"}, status_code=503)
+    
+    if video_params is None:
+        video_params = {}
+    
+    fps = video_params.get('fps', 30.0)
+    output_name = video_params.get('output_name')
+    
+    try:
+        create_video_from_session(
+            session_id=session_id,
+            storage_path=str(recorder.storage_path),
+            output_name=output_name,
+            fps=fps
+        )
+        return {"success": True, "session_id": session_id}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+@app.get("/api/recording/session/{session_id}/frame/{frame_id}")
+async def get_frame(session_id: str, frame_id: str):
+    """Get a specific frame from a session"""
+    if not recorder:
+        return JSONResponse({"error": "Recorder not initialized"}, status_code=503)
+    
+    try:
+        frame_number = int(frame_id)
+        frame = recorder.get_frame(session_id, frame_number)
+        
+        if frame is None:
+            return JSONResponse({"error": "Frame not found"}, status_code=404)
+        
+        _, buffer = cv2.imencode('.jpg', frame)
+        
+        return StreamingResponse(
+            iter([buffer.tobytes()]),
+            media_type="image/jpeg"
+        )
+    except ValueError:
+        return JSONResponse({"error": "Invalid frame ID"}, status_code=400)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/recording/session/{session_id}/frame/{frame_id}/metadata")
+async def get_frame_metadata(session_id: str, frame_id: str):
+    """Get metadata for a specific frame"""
+    if not recorder:
+        return JSONResponse({"error": "Recorder not initialized"}, status_code=503)
+    
+    try:
+        frame_number = int(frame_id)
+        metadata = recorder.get_frame_metadata(session_id, frame_number)
+        
+        if metadata is None:
+            return JSONResponse({"error": "Metadata not found"}, status_code=404)
+        
+        return metadata
+    except ValueError:
+        return JSONResponse({"error": "Invalid frame ID"}, status_code=400)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+@app.get("/api/recording/session/{session_id}/lidar/{frame_id}")
+async def get_lidar_from_session(session_id: str, frame_id: str):
+    """Get LiDAR data for a specific frame from a session"""
+    if not recorder:
+        return JSONResponse({"error": "Recorder not initialized"}, status_code=503)
+
+    lidar_path = recorder.get_sensor_data_file_path(session_id, frame_id)
+    
+    if not lidar_path or not os.path.exists(lidar_path):
+        return JSONResponse({"error": "LiDAR data not found"}, status_code=404)
+    
+    try:
+        with open(lidar_path, 'r') as f:
+            lidar_data = json.load(f)
+        return lidar_data
+    except Exception as e:
+        return JSONResponse({"error": f"Error reading LiDAR data: {str(e)}"}, status_code=500)
+
+
+# --- Streamlit Polling Endpoint (CRITICAL for Streamlit Frontend) ---
+
+@app.get("/api/latest_stream_data")
+async def get_latest_stream_data_endpoint():
+    """Endpoint for Streamlit frontend to poll the latest stream data directly from ROS2.
+    
+    ✅ FIXED: This endpoint now reads directly from ros2_bridge instead of relying on
+    the WebSocket cache (which was never populated because no WebSocket client connects).
+    """
+    global ros2_bridge, recorder, config
+    
+    if not ros2_bridge:
+        return {
+            "type": "frame",
+            "camera": {"data": None, "timestamp": None},
+            "lidar": None,
+            "odom": None,
+            "recording": False
+        }
+    
+    # ✅ CRITICAL FIX: Read data DIRECTLY from ros2_bridge
+    frame, timestamp = ros2_bridge.get_latest_camera_frame()
+    lidar_data, _ = ros2_bridge.get_latest_lidar_data()
+    odom_data, _ = ros2_bridge.get_latest_odom()
+    
+    # Record frame if recording is active
+    if recorder and recorder.is_recording and frame is not None:
+        recorder.record_frame(frame, metadata={
+            'timestamp': timestamp,
+            'lidar': lidar_data,
+            'odom': odom_data
+        })
+    
+    # Encode frame to base64
+    frame_b64 = None
+    if frame is not None:
+        quality = config.get('streaming', {}).get('image_quality', 60)
+        if frame.size > 0:
+            is_success, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
+            if is_success:
+                frame_b64 = base64.b64encode(buffer.tobytes()).decode('utf-8')
+    
+    return {
+        "type": "frame",
+        "camera": {
+            "data": frame_b64,
+            "timestamp": timestamp
+        },
+        "lidar": lidar_data,
+        "odom": odom_data,
+        "recording": recorder.is_recording if recorder else False
+    }
+
+
+# --- WebSocket Endpoint (Main Data Stream) ---
+
+@app.websocket("/ws/stream")
+async def websocket_endpoint(websocket: WebSocket):
+    """WebSocket endpoint for real-time data streaming and Streamlit cache updates."""
+    await websocket.accept()
+    global ros2_bridge, recorder, latest_stream_cache
+    
+    if not ros2_bridge:
+        await websocket.close(code=1011, reason="ROS2 Bridge not initialized")
+        return
+
+    try:
+        while True:
+            # 1. Get ALL latest data (CRITICAL: Called only once per loop)
+            # This consumes the frame from the ROS2 buffer for all purposes.
+            frame, timestamp = ros2_bridge.get_latest_camera_frame()
+            lidar_data, _ = ros2_bridge.get_latest_lidar_data()
+            odom_data, _ = ros2_bridge.get_latest_odom()
+
+            # --- Encoding and Frame Caching ---
+            frame_b64 = None
+            if frame is not None:
+                # Encode frame 
+                quality = config.get('streaming', {}).get('image_quality', 85)
+                # Ensure frame is not empty before encoding (robustness check)
+                if frame.size > 0:
+                    is_success, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
+                    if is_success:
+                        frame_b64 = base64.b64encode(buffer.tobytes()).decode('utf-8')
+            
+            # 2. Prepare message (ALWAYS prepare a message, even if data is None)
+            message = {
+                "type": "frame",
+                "camera": {
+                    "data": frame_b64,  # This will be None if the camera failed
+                    "timestamp": timestamp
+                },
+                "lidar": lidar_data,
+                "odom": odom_data,
+                "recording": recorder.is_recording if recorder else False
+            }
+            
+            # 3. Update the stream cache (CRITICAL for Streamlit's /api/latest_stream_data polling)
+            latest_stream_cache = message
+            
+            # 4. Send the message to WebSocket clients (if any are connected)
+            await websocket.send_json(message)
+
+            # 5. Record frame (using the SAME frame retrieved in step 1)
+            if recorder and recorder.is_recording and ros2_bridge:
+                if frame is not None:
+                    recorder.record_frame(frame, lidar_data, odom_data, timestamp)
+            
+            # 6. Control loop rate
+            max_fps = config.get('streaming', {}).get('max_fps', 10.0)
+            await asyncio.sleep(1.0 / max_fps)
+            
+    except WebSocketDisconnect:
+        print("WebSocket client disconnected.")
+    except Exception as e:
+        print(f"WebSocket error: {e}")
+
+
+if __name__ == "__main__":
+    import uvicorn
+    # Use the application object initialized with lifespan
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+
+# ========== ./backend/backup/fast_recorder_integrated.py ==========
+"""
+Enhanced Fast Recorder with Alert Support
+Integrates fast frame recording with metadata tracking for alerts
+"""
+import time
+import os
+import shutil
+import json
+from datetime import datetime
+from typing import Optional, Dict, Any, List
+import cv2
+import numpy as np
+from pathlib import Path
+
+
+class FastRecorder:
+    """
+    High-performance recorder that saves frames directly to disk
+    with minimal processing overhead and alert metadata tracking.
+    """
+    
+    def __init__(self, storage_path: str = "recordings"):
+        self.storage_path = Path(storage_path)
+        self.storage_path.mkdir(parents=True, exist_ok=True)
+        
+        self.is_recording = False
+        self.current_session_id: Optional[str] = None
+        self.current_session_path: Optional[Path] = None
+        self.frame_count = 0
+        self.start_time: Optional[float] = None
+        
+        # FPS tracking
+        self.fps_log: Optional[object] = None
+        self.frame_timestamps: List[float] = []
+        
+        # Alert tracking
+        self.alerts: List[Dict[str, Any]] = []
+        
+        # Performance tracking
+        self.prev_time = time.time()
+        self.fps_frame_count = 0
+        self.current_fps = 0.0
+        
+    def start_recording(self) -> str:
+        """Start a new recording session"""
+        if self.is_recording:
+            raise RuntimeError("Already recording")
+        
+        # Create session directory
+        self.current_session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.current_session_path = self.storage_path / self.current_session_id
+        self.current_session_path.mkdir(parents=True, exist_ok=True)
+        
+        # Create frames subdirectory
+        frames_dir = self.current_session_path / "frames"
+        frames_dir.mkdir(exist_ok=True)
+        
+        # Initialize tracking
+        self.frame_count = 0
+        self.start_time = time.time()
+        self.frame_timestamps = []
+        self.alerts = []
+        
+        # Open FPS log
+        fps_log_path = self.current_session_path / "frame_timestamps.txt"
+        self.fps_log = open(fps_log_path, 'w')
+        
+        self.is_recording = True
+        print(f"[FastRecorder] Recording started: {self.current_session_id}")
+        
+        return self.current_session_id
+    
+    def record_frame(self, frame: np.ndarray, metadata: Optional[Dict[str, Any]] = None) -> bool:
+        """
+        Record a single frame with optional metadata
+        
+        Args:
+            frame: OpenCV image (numpy array)
+            metadata: Optional metadata dict (lidar, odom, etc.)
+        
+        Returns:
+            True if frame was recorded successfully
+        """
+        if not self.is_recording or frame is None:
+            return False
+        
+        try:
+            current_time = time.time()
+            self.frame_count += 1
+            
+            # Log timestamp
+            self.fps_log.write(f"{current_time}\n")
+            self.fps_log.flush()  # Ensure immediate write
+            self.frame_timestamps.append(current_time)
+            
+            # Save frame (JPEG for speed)
+            frame_filename = f"frame_{self.frame_count:06d}.jpg"
+            frame_path = self.current_session_path / "frames" / frame_filename
+            
+            # Fast JPEG encoding (quality 90 for good balance)
+            cv2.imwrite(str(frame_path), frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            
+            # Save metadata if provided
+            if metadata:
+                metadata_filename = f"frame_{self.frame_count:06d}.json"
+                metadata_path = self.current_session_path / "frames" / metadata_filename
+                
+                # Add timestamp to metadata
+                metadata['timestamp'] = current_time
+                metadata['frame_number'] = self.frame_count
+                
+                with open(metadata_path, 'w') as f:
+                    json.dump(metadata, f)
+            
+            # Update FPS calculation (every 1 second)
+            self.fps_frame_count += 1
+            if current_time - self.prev_time >= 1.0:
+                self.current_fps = self.fps_frame_count / (current_time - self.prev_time)
+                self.prev_time = current_time
+                self.fps_frame_count = 0
+                print(f"[FastRecorder] Current FPS: {self.current_fps:.2f}")
+            
+            return True
+            
+        except Exception as e:
+            print(f"[FastRecorder] Error recording frame: {e}")
+            return False
+    
+    def add_alert(self, alert_type: str = "manual", description: str = "", 
+                  metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """
+        Add an alert marker to the current recording
+        
+        Args:
+            alert_type: Type of alert ("manual", "anomaly", "event", etc.)
+            description: Human-readable description
+            metadata: Additional metadata
+        
+        Returns:
+            Alert dict with timestamp and frame number
+        """
+        if not self.is_recording:
+            raise RuntimeError("Not recording")
+        
+        alert = {
+            'timestamp': time.time(),
+            'frame_number': self.frame_count,
+            'type': alert_type,
+            'description': description,
+            'metadata': metadata or {}
+        }
+        
+        self.alerts.append(alert)
+        print(f"[FastRecorder] Alert added at frame {self.frame_count}: {alert_type}")
+        
+        return alert
+    
+    def stop_recording(self) -> Dict[str, Any]:
+        """
+        Stop recording and save session metadata
+        
+        Returns:
+            Session summary dict
+        """
+        if not self.is_recording:
+            raise RuntimeError("Not recording")
+        
+        end_time = time.time()
+        duration = end_time - self.start_time
+        
+        # Close FPS log
+        self.fps_log.close()
+        
+        # Calculate average FPS
+        if len(self.frame_timestamps) > 1:
+            first_time = self.frame_timestamps[0]
+            last_time = self.frame_timestamps[-1]
+            avg_fps = len(self.frame_timestamps) / (last_time - first_time) if (last_time - first_time) > 0 else 0
+        else:
+            avg_fps = 0
+        
+        # Create session metadata
+        session_metadata = {
+            'session_id': self.current_session_id,
+            'start_time': self.start_time,
+            'end_time': end_time,
+            'duration': duration,
+            'total_frames': self.frame_count,
+            'average_fps': avg_fps,
+            'alerts': self.alerts,
+            'alert_count': len(self.alerts)
+        }
+        
+        # Save session metadata
+        metadata_path = self.current_session_path / "session_metadata.json"
+        with open(metadata_path, 'w') as f:
+            json.dump(session_metadata, f, indent=2)
+        
+        # Save alerts separately for easy access
+        if self.alerts:
+            alerts_path = self.current_session_path / "alerts.json"
+            with open(alerts_path, 'w') as f:
+                json.dump(self.alerts, f, indent=2)
+        
+        print(f"[FastRecorder] Recording stopped")
+        print(f"[FastRecorder] Total frames: {self.frame_count}")
+        print(f"[FastRecorder] Duration: {duration:.2f}s")
+        print(f"[FastRecorder] Average FPS: {avg_fps:.2f}")
+        print(f"[FastRecorder] Alerts: {len(self.alerts)}")
+        
+        self.is_recording = False
+        self.current_session_id = None
+        self.current_session_path = None
+        
+        return session_metadata
+    
+    def get_recording_status(self) -> Dict[str, Any]:
+        """Get current recording status"""
+        if not self.is_recording:
+            return {
+                'is_recording': False,
+                'session_id': None,
+                'frames_recorded': 0,
+                'duration': 0,
+                'current_fps': 0,
+                'alerts': 0
+            }
+        
+        duration = time.time() - self.start_time if self.start_time else 0
+        
+        return {
+            'is_recording': True,
+            'session_id': self.current_session_id,
+            'frames_recorded': self.frame_count,
+            'duration': duration,
+            'current_fps': self.current_fps,
+            'alerts': len(self.alerts)
+        }
+    
+    def get_sessions(self) -> List[Dict[str, Any]]:
+        """Get list of all recorded sessions"""
+        sessions = []
+        
+        for session_dir in sorted(self.storage_path.iterdir(), reverse=True):
+            if not session_dir.is_dir():
+                continue
+            
+            metadata_path = session_dir / "session_metadata.json"
+            if metadata_path.exists():
+                with open(metadata_path, 'r') as f:
+                    metadata = json.load(f)
+                    sessions.append(metadata)
+        
+        return sessions
+    
+    def get_session_metadata(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Get metadata for a specific session"""
+        session_path = self.storage_path / session_id
+        metadata_path = session_path / "session_metadata.json"
+        
+        if not metadata_path.exists():
+            return None
+        
+        with open(metadata_path, 'r') as f:
+            return json.load(f)
+    
+    def get_frame(self, session_id: str, frame_number: int) -> Optional[np.ndarray]:
+        """Load a specific frame from a session"""
+        session_path = self.storage_path / session_id
+        frame_filename = f"frame_{frame_number:06d}.jpg"
+        frame_path = session_path / "frames" / frame_filename
+        
+        if not frame_path.exists():
+            return None
+        
+        return cv2.imread(str(frame_path))
+    
+    def get_frame_metadata(self, session_id: str, frame_number: int) -> Optional[Dict[str, Any]]:
+        """Load metadata for a specific frame"""
+        session_path = self.storage_path / session_id
+        metadata_filename = f"frame_{frame_number:06d}.json"
+        metadata_path = session_path / "frames" / metadata_filename
+        
+        if not metadata_path.exists():
+            return None
+        
+        with open(metadata_path, 'r') as f:
+            return json.load(f)
+
+
+# Standalone video creation utility
+def create_video_from_session(session_id: str, storage_path: str = "recordings", 
+                              output_name: Optional[str] = None, fps: float = 30.0):
+    """
+    Create a video from a recorded session
+    
+    Args:
+        session_id: Session ID to convert
+        storage_path: Base recordings directory
+        output_name: Output video filename (default: session_id.mp4)
+        fps: Target FPS for video
+    """
+    session_path = Path(storage_path) / session_id
+    frames_dir = session_path / "frames"
+    
+    if not frames_dir.exists():
+        print(f"Error: Session {session_id} not found")
+        return
+    
+    # Get all frame files
+    frame_files = sorted([f for f in frames_dir.iterdir() if f.suffix == '.jpg'])
+    
+    if not frame_files:
+        print("Error: No frames found in session")
+        return
+    
+    # Read first frame to get dimensions
+    first_frame = cv2.imread(str(frame_files[0]))
+    height, width = first_frame.shape[:2]
+    
+    # Output filename
+    if output_name is None:
+        output_name = f"{session_id}.mp4"
+    
+    output_path = session_path / output_name
+    
+    # Initialize VideoWriter
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
+    
+    print(f"Creating video with {len(frame_files)} frames at {fps} FPS...")
+    
+    for i, frame_file in enumerate(frame_files):
+        frame = cv2.imread(str(frame_file))
+        out.write(frame)
+        
+        if (i + 1) % 100 == 0:
+            print(f"Processed {i + 1}/{len(frame_files)} frames...")
+    
+    out.release()
+    
+    print(f"Video created: {output_path}")
+    print(f"Size: {output_path.stat().st_size / 1024 / 1024:.2f} MB")
+
+
+if __name__ == "__main__":
+    # Example usage
+    print("FastRecorder Test")
+    
+    recorder = FastRecorder()
+    
+    # Start recording
+    session_id = recorder.start_recording()
+    
+    # Simulate recording frames
+    for i in range(100):
+        # Create dummy frame
+        frame = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
+        
+        # Add alert at frame 50
+        if i == 50:
+            recorder.add_alert("manual", "Test alert at frame 50")
+        
+        recorder.record_frame(frame, metadata={'frame_id': i})
+        time.sleep(0.033)  # ~30 FPS
+    
+    # Stop recording
+    summary = recorder.stop_recording()
+    print(f"\nSession summary: {summary}")
+    
+    # Create video
+    create_video_from_session(session_id)
+
+# ========== ./backend/create_video.py ==========
+#!/usr/bin/env python3
+"""
+Video Creation Utility
+Creates MP4 videos from recorded sessions with proper FPS
+"""
+import cv2
+import os
+import sys
+import json
+from pathlib import Path
+import argparse
+
+
+def create_video(session_id: str, storage_path: str = "recordings", 
+                 output_name: str = None, fps: float = None):
+    """
+    Create a video from a recorded session
+    
+    Args:
+        session_id: Session ID to convert
+        storage_path: Base recordings directory
+        output_name: Output video filename (default: session_id.mp4)
+        fps: Target FPS for video (default: use session average FPS)
+    """
+    session_path = Path(storage_path) / session_id
+    frames_dir = session_path / "frames"
+    
+    if not frames_dir.exists():
+        print(f"❌ Error: Session '{session_id}' not found in {storage_path}")
+        return False
+    
+    # Load session metadata
+    metadata_path = session_path / "session_metadata.json"
+    if metadata_path.exists():
+        with open(metadata_path, 'r') as f:
+            metadata = json.load(f)
+            if fps is None:
+                fps = metadata.get('average_fps', 30.0)
+            print(f"📊 Session Info:")
+            print(f"   Duration: {metadata['duration']:.2f}s")
+            print(f"   Total Frames: {metadata['total_frames']}")
+            print(f"   Average FPS: {metadata['average_fps']:.2f}")
+            print(f"   Alerts: {metadata['alert_count']}")
+    else:
+        if fps is None:
+            fps = 30.0
+        print(f"⚠️  Warning: No metadata found, using default FPS: {fps}")
+    
+    # Get all frame files
+    frame_files = sorted([f for f in frames_dir.iterdir() if f.suffix == '.jpg'])
+    
+    if not frame_files:
+        print("❌ Error: No frames found in session")
+        return False
+    
+    print(f"\n🎬 Creating video...")
+    print(f"   Frames: {len(frame_files)}")
+    print(f"   Target FPS: {fps:.2f}")
+    
+    # Read first frame to get dimensions
+    first_frame = cv2.imread(str(frame_files[0]))
+    if first_frame is None:
+        print("❌ Error: Failed to read first frame")
+        return False
+    
+    height, width = first_frame.shape[:2]
+    print(f"   Resolution: {width}x{height}")
+    
+    # Output filename
+    if output_name is None:
+        output_name = f"{session_id}.mp4"
+    
+    output_path = session_path / output_name
+    
+    # Initialize VideoWriter
+    # Try different codecs in order of preference
+    codecs = [
+        ('mp4v', 'MP4V'),  # Most compatible
+        ('avc1', 'H.264'), # Better quality
+        ('XVID', 'XVID'),  # Fallback
+    ]
+    
+    out = None
+    for codec, name in codecs:
+        try:
+            fourcc = cv2.VideoWriter_fourcc(*codec)
+            out = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
+            if out.isOpened():
+                print(f"   Codec: {name}")
+                break
+        except:
+            continue
+    
+    if out is None or not out.isOpened():
+        print("❌ Error: Failed to initialize video writer")
+        return False
+    
+    # Write frames
+    print(f"\n⏳ Processing frames...")
+    for i, frame_file in enumerate(frame_files):
+        frame = cv2.imread(str(frame_file))
+        if frame is not None:
+            out.write(frame)
+        
+        # Progress indicator
+        if (i + 1) % 100 == 0 or (i + 1) == len(frame_files):
+            progress = (i + 1) / len(frame_files) * 100
+            print(f"   Progress: {i + 1}/{len(frame_files)} ({progress:.1f}%)")
+    
+    out.release()
+    
+    # Get file size
+    file_size_mb = output_path.stat().st_size / 1024 / 1024
+    
+    print(f"\n✅ Video created successfully!")
+    print(f"   Output: {output_path}")
+    print(f"   Size: {file_size_mb:.2f} MB")
+    print(f"   Duration: {len(frame_files) / fps:.2f}s")
+    
+    return True
+
+
+def list_sessions(storage_path: str = "recordings"):
+    """List all available sessions"""
+    storage = Path(storage_path)
+    
+    if not storage.exists():
+        print(f"❌ Error: Storage path '{storage_path}' not found")
+        return
+    
+    sessions = []
+    for session_dir in sorted(storage.iterdir(), reverse=True):
+        if not session_dir.is_dir():
+            continue
+        
+        metadata_path = session_dir / "session_metadata.json"
+        if metadata_path.exists():
+            with open(metadata_path, 'r') as f:
+                metadata = json.load(f)
+                sessions.append({
+                    'id': session_dir.name,
+                    'metadata': metadata
+                })
+    
+    if not sessions:
+        print("📭 No sessions found")
+        return
+    
+    print(f"📁 Available Sessions ({len(sessions)}):\n")
+    for session in sessions:
+        meta = session['metadata']
+        print(f"   ID: {session['id']}")
+        print(f"   Duration: {meta['duration']:.2f}s")
+        print(f"   Frames: {meta['total_frames']}")
+        print(f"   FPS: {meta['average_fps']:.2f}")
+        print(f"   Alerts: {meta['alert_count']}")
+        print()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Create videos from recorded sessions',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # List all sessions
+  python create_video.py --list
+
+  # Create video from session
+  python create_video.py 20250115_143022
+
+  # Create video with custom FPS
+  python create_video.py 20250115_143022 --fps 60
+
+  # Create video with custom output name
+  python create_video.py 20250115_143022 --output my_video.mp4
+        """
+    )
+    
+    parser.add_argument('session_id', nargs='?', help='Session ID to convert')
+    parser.add_argument('--list', action='store_true', help='List all available sessions')
+    parser.add_argument('--storage', default='recordings', help='Recordings storage path')
+    parser.add_argument('--fps', type=float, help='Target FPS for video (default: use session FPS)')
+    parser.add_argument('--output', help='Output video filename')
+    
+    args = parser.parse_args()
+    
+    if args.list:
+        list_sessions(args.storage)
+        return
+    
+    if not args.session_id:
+        parser.print_help()
+        return
+    
+    success = create_video(
+        session_id=args.session_id,
+        storage_path=args.storage,
+        output_name=args.output,
+        fps=args.fps
+    )
+    
+    sys.exit(0 if success else 1)
+
+
+if __name__ == '__main__':
+    main()
+
+# ========== ./backend/app.py ==========
+"""
+FastAPI Backend - Main server for Yahboom Dashboard
+"""
+import rclpy
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
+import cv2
+import json
+import yaml
+import asyncio
+from pathlib import Path
+import base64
+from typing import Optional, Dict, Any
+import threading
+import time
+import io
+import os 
+
+import numpy as np
+from PIL import Image
+
+# Local Imports (Assuming these are in the same directory structure)
+from ros2_bridge import ROS2Bridge
+from fast_recorder_integrated import FastRecorder, create_video_from_session
+from camera_node import CameraNode 
+
+# --- Global State ---
+ros2_bridge: Optional[ROS2Bridge] = None
+camera_node: Optional[CameraNode] = None
+recorder: Optional[FastRecorder] = None
+config: dict = {}
+recording_fps: float = 10.0  
+# Cache for the latest data sent over the WebSocket for Streamlit polling
+latest_stream_cache: Dict[str, Any] = {}
+
+
+# --- Helper Functions ---
+
+def load_config():
+    """Load configuration from YAML file (Requires a config/config.yaml file)"""
+    config_path = Path(__file__).parent.parent / 'config' / 'config.yaml'
+    
+    # Fallback to an empty dict if config file isn't found
+    if not config_path.exists():
+        print("Warning: config/config.yaml not found. Using default settings.")
+        return {
+            "camera": {"enabled": True, "video_source": 0, "fps": 15},
+            "streaming": {"max_fps": 10.0, "image_quality": 85},
+            "recording": {"storage_path": "recordings", "sync_interval_ms": 100}
+        }
+
+    with open(config_path, 'r') as f:
+        return yaml.safe_load(f)
+
+
+def init_ros2():
+    """Initialize ROS2 node and start executor in background thread"""
+    global ros2_bridge, camera_node
+    if not rclpy.ok():
+        rclpy.init()
+    
+    # Initialize camera node if enabled
+    if config.get('camera', {}).get('enabled', False):
+        if camera_node is None:
+            try:
+                # CameraNode now takes the full config
+                camera_node = CameraNode(config) 
+            except Exception as e:
+                print(f"Warning: Could not initialize camera node: {e}")
+                camera_node = None
+    
+    # Initialize ROS2 bridge
+    if ros2_bridge is None:
+        ros2_bridge = ROS2Bridge(config)
+        
+        # Start ROS2 executor in background thread
+        def spin_ros2():
+            executor = rclpy.executors.SingleThreadedExecutor()
+            executor.add_node(ros2_bridge)
+            # Add camera node to executor if it exists
+            if camera_node:
+                executor.add_node(camera_node)
+            try:
+                executor.spin()
+            except KeyboardInterrupt:
+                pass
+            except Exception as e:
+                print(f"ROS 2 Executor error: {e}")
+        
+        ros2_thread = threading.Thread(target=spin_ros2, daemon=True)
+        ros2_thread.start()
+
+
+# ❗ CRITICAL CHANGE: The conflicting 'async def recording_task()' function is removed.
+# Recording is now handled inside the websocket_endpoint loop.
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager for startup and shutdown"""
+    # Startup
+    global config, recorder
+    config = load_config()
+    
+    # Initialize FastRecorder with storage path from config
+    storage_path = config.get('recording', {}).get('storage_path', 'recordings')
+    recorder = FastRecorder(storage_path=storage_path)
+    print(f"[FastRecorder] Initialized with storage: {storage_path}")
+    
+    # Initialize ROS 2 bridge and nodes
+    init_ros2()
+    
+    # ❗ CRITICAL CHANGE: Removed: recording_task_handle = asyncio.create_task(recording_task())
+    
+    print("FastAPI startup complete. ROS 2 and Recorder initialized.")
+    yield
+    
+    # Shutdown
+    # ❗ CRITICAL CHANGE: Removed cancellation for recording_task_handle
+    
+    global camera_node
+    if camera_node:
+        camera_node.stop_camera()
+        camera_node.destroy_node()
+    if ros2_bridge:
+        ros2_bridge.destroy_node()
+    if rclpy.ok():
+        rclpy.shutdown()
+    
+    print("FastAPI shutdown complete.")
+
+
+app = FastAPI(title="Yahboom Dashboard API", lifespan=lifespan)
+
+# CORS middleware
+origins = ["*"]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# --- REST Endpoints ---
+
+@app.get("/")
+async def root():
+    """Health check endpoint"""
+    return {"status": "online", "service": "yahboom_dashboard"}
+
+
+@app.get("/api/status")
+async def get_status():
+    """Get current system status"""
+    recording_info = recorder.get_recording_status() if recorder else None
+
+    # Use peek properties for status checks
+    cam_active = ros2_bridge.latest_camera_frame is not None if ros2_bridge else False
+    lidar_active = ros2_bridge.latest_lidar_data is not None if ros2_bridge else False
+    map_active = ros2_bridge.latest_map is not None if ros2_bridge else False
+    
+    return {
+        "ros2_connected": ros2_bridge is not None,
+        "recording": recorder.is_recording if recorder else False,
+        "recording_session": recording_info,
+        "camera_available": cam_active,
+        "lidar_available": lidar_active,
+        "map_available": map_active
+    }
+
+
+# The original /api/camera/latest, /api/lidar/latest, /api/odom/latest are now redundant 
+# for the Streamlit frontend because of the new /api/latest_stream_data endpoint, 
+# but we keep them for direct API access and to match the template structure.
+
+@app.get("/api/camera/latest")
+async def get_latest_camera():
+    """Get latest camera frame as JPEG"""
+    if not ros2_bridge:
+        return JSONResponse({"error": "ROS2 not initialized"}, status_code=503)
+    
+    # Use get_latest_camera_frame() which clears the frame
+    frame, timestamp = ros2_bridge.get_latest_camera_frame() 
+    if frame is None:
+        return JSONResponse({"error": "No camera data available"}, status_code=404)
+    
+    # Encode as JPEG
+    quality = config.get('streaming', {}).get('image_quality', 85)
+    _, buffer = cv2.imencode('.jpg', frame, 
+                            [cv2.IMWRITE_JPEG_QUALITY, quality])
+    
+    return StreamingResponse(
+        iter([buffer.tobytes()]),
+        media_type="image/jpeg",
+        headers={"X-Timestamp": str(timestamp)}
+    )
+
+# ... (other REST endpoints like /api/lidar/latest, /api/map/latest, /api/odom/latest remain as in your template) ...
+
+@app.get("/api/map/latest")
+async def get_latest_map():
+    """Get latest occupancy grid map rendered as PNG"""
+    if not ros2_bridge:
+        return JSONResponse({"error": "ROS2 not initialized"}, status_code=503)
+    
+    map_data = ros2_bridge.get_latest_map()
+    if map_data is None:
+        return JSONResponse({"error": "No map data available"}, status_code=404)
+    
+    try:
+        width = map_data['width']
+        height = map_data['height']
+        # Ensure data is treated as numpy array
+        data = np.array(map_data['data'], dtype=np.int8) 
+        if data.size != width * height:
+            return JSONResponse({"error": "Invalid map data size"}, status_code=500)
+        
+        grid = data.reshape((height, width))
+        
+        # Create RGB image: free (0) -> white, occupied (> 50) -> black, unknown (-1) -> gray
+        image = np.zeros((height, width, 3), dtype=np.uint8)
+        image[:] = (127, 127, 127)  # Unknown default (Gray)
+        
+        free_mask = grid == 0
+        occ_mask = grid > 50
+        
+        image[free_mask] = (220, 220, 220) # White/Light Gray
+        image[occ_mask] = (0, 0, 0) # Black
+        
+        # Flip vertically so origin matches typical SLAM conventions
+        image = np.flipud(image)
+        
+        pil_image = Image.fromarray(image)
+        buffer = io.BytesIO()
+        pil_image.save(buffer, format="PNG")
+        
+        encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
+        
+        return {
+            "map": {
+                "width": width,
+                "height": height,
+                "resolution": map_data.get("resolution"),
+                "origin": map_data.get("origin"),
+                "timestamp": map_data.get("timestamp"),
+                "image": encoded
+            }
+        }
+    except Exception as e:
+        return JSONResponse({"error": f"Map processing error: {str(e)}"}, status_code=500)
+
+
+# --- Recording Endpoints ---
+
+@app.post("/api/recording/start")
+async def start_recording():
+    """Start recording session"""
+    if not recorder:
+        return JSONResponse({"error": "Recorder not initialized"}, status_code=503)
+    
+    session_id = recorder.start_recording() 
+    return {"session_id": session_id, "status": "recording"}
+
+
+@app.post("/api/recording/stop")
+async def stop_recording():
+    """Stop recording session"""
+    if not recorder:
+        return JSONResponse({"error": "Recorder not initialized"}, status_code=503)
+    
+    if not recorder.is_recording:
+        return JSONResponse({"error": "Not recording"}, status_code=400)
+    
+    summary = recorder.stop_recording()
+    return summary
+
+
+@app.get("/api/recording/status")
+async def get_recording_status():
+    """Get current recording status"""
+    if not recorder:
+        return JSONResponse({"error": "Recorder not initialized"}, status_code=503)
+    
+    return recorder.get_recording_status()
+
+
+@app.get("/api/recording/sessions")
+async def get_sessions():
+    """Get list of all recorded sessions"""
+    if not recorder:
+        return JSONResponse({"error": "Recorder not initialized"}, status_code=503)
+    
+    sessions = recorder.get_sessions()
+    return {"sessions": sessions}
+
+
+@app.get("/api/recording/session/{session_id}")
+async def get_session(session_id: str):
+    """Get metadata for a specific session"""
+    if not recorder:
+        return JSONResponse({"error": "Recorder not initialized"}, status_code=503)
+    
+    metadata = recorder.get_session_metadata(session_id)
+    
+    if not metadata:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    
+    return metadata
+
+
+@app.post("/api/recording/alert")
+async def add_alert(alert_data: dict):
+    """Add alert to current recording"""
+    if not recorder:
+        return JSONResponse({"error": "Recorder not initialized"}, status_code=503)
+    
+    if not recorder.is_recording:
+        return JSONResponse({"error": "Not recording"}, status_code=400)
+    
+    try:
+        alert = recorder.add_alert(
+            alert_type=alert_data.get('type', 'manual'),
+            description=alert_data.get('description', ''),
+            metadata=alert_data.get('metadata', {})
+        )
+        return {"success": True, "alert": alert}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/recording/session/{session_id}/alerts")
+async def get_session_alerts(session_id: str):
+    """Get alerts for a session"""
+    if not recorder:
+        return JSONResponse({"error": "Recorder not initialized"}, status_code=503)
+    
+    metadata = recorder.get_session_metadata(session_id)
+    
+    if not metadata:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    
+    return {"alerts": metadata.get('alerts', [])}
+
+
+@app.post("/api/recording/session/{session_id}/create_video")
+async def create_session_video(session_id: str, video_params: dict = None):
+    """Create video from session"""
+    if not recorder:
+        return JSONResponse({"error": "Recorder not initialized"}, status_code=503)
+    
+    if video_params is None:
+        video_params = {}
+    
+    fps = video_params.get('fps', 30.0)
+    output_name = video_params.get('output_name')
+    
+    try:
+        create_video_from_session(
+            session_id=session_id,
+            storage_path=str(recorder.storage_path),
+            output_name=output_name,
+            fps=fps
+        )
+        return {"success": True, "session_id": session_id}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+@app.get("/api/recording/session/{session_id}/frame/{frame_id}")
+async def get_frame(session_id: str, frame_id: str):
+    """Get a specific frame from a session"""
+    if not recorder:
+        return JSONResponse({"error": "Recorder not initialized"}, status_code=503)
+    
+    try:
+        frame_number = int(frame_id)
+        frame = recorder.get_frame(session_id, frame_number)
+        
+        if frame is None:
+            return JSONResponse({"error": "Frame not found"}, status_code=404)
+        
+        _, buffer = cv2.imencode('.jpg', frame)
+        
+        return StreamingResponse(
+            iter([buffer.tobytes()]),
+            media_type="image/jpeg"
+        )
+    except ValueError:
+        return JSONResponse({"error": "Invalid frame ID"}, status_code=400)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/recording/session/{session_id}/frame/{frame_id}/metadata")
+async def get_frame_metadata(session_id: str, frame_id: str):
+    """Get metadata for a specific frame"""
+    if not recorder:
+        return JSONResponse({"error": "Recorder not initialized"}, status_code=503)
+    
+    try:
+        frame_number = int(frame_id)
+        metadata = recorder.get_frame_metadata(session_id, frame_number)
+        
+        if metadata is None:
+            return JSONResponse({"error": "Metadata not found"}, status_code=404)
+        
+        return metadata
+    except ValueError:
+        return JSONResponse({"error": "Invalid frame ID"}, status_code=400)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+@app.get("/api/recording/session/{session_id}/lidar/{frame_id}")
+async def get_lidar_from_session(session_id: str, frame_id: str):
+    """Get LiDAR data for a specific frame from a session"""
+    if not recorder:
+        return JSONResponse({"error": "Recorder not initialized"}, status_code=503)
+
+    lidar_path = recorder.get_sensor_data_file_path(session_id, frame_id)
+    
+    if not lidar_path or not os.path.exists(lidar_path):
+        return JSONResponse({"error": "LiDAR data not found"}, status_code=404)
+    
+    try:
+        with open(lidar_path, 'r') as f:
+            lidar_data = json.load(f)
+        return lidar_data
+    except Exception as e:
+        return JSONResponse({"error": f"Error reading LiDAR data: {str(e)}"}, status_code=500)
+
+
+# --- Streamlit Polling Endpoint (CRITICAL for Streamlit Frontend) ---
+
+@app.get("/api/latest_stream_data")
+async def get_latest_stream_data_endpoint():
+    """Endpoint for Streamlit frontend to poll the latest stream data directly from ROS2.
+    
+    ✅ FIXED: This endpoint now reads directly from ros2_bridge instead of relying on
+    the WebSocket cache (which was never populated because no WebSocket client connects).
+    """
+    global ros2_bridge, recorder, config
+    
+    if not ros2_bridge:
+        return {
+            "type": "frame",
+            "camera": {"data": None, "timestamp": None},
+            "lidar": None,
+            "odom": None,
+            "recording": False
+        }
+    
+    # ✅ CRITICAL FIX: Read data DIRECTLY from ros2_bridge
+    frame, timestamp = ros2_bridge.get_latest_camera_frame()
+    lidar_data, _ = ros2_bridge.get_latest_lidar_data()
+    odom_data, _ = ros2_bridge.get_latest_odom()
+    
+    # Record frame if recording is active
+    if recorder and recorder.is_recording and frame is not None:
+        recorder.record_frame(frame, metadata={
+            'timestamp': timestamp,
+            'lidar': lidar_data,
+            'odom': odom_data
+        })
+    
+    # Encode frame to base64
+    frame_b64 = None
+    if frame is not None:
+        quality = config.get('streaming', {}).get('image_quality', 60)
+        if frame.size > 0:
+            is_success, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
+            if is_success:
+                frame_b64 = base64.b64encode(buffer.tobytes()).decode('utf-8')
+    
+    return {
+        "type": "frame",
+        "camera": {
+            "data": frame_b64,
+            "timestamp": timestamp
+        },
+        "lidar": lidar_data,
+        "odom": odom_data,
+        "recording": recorder.is_recording if recorder else False
+    }
+
+
+# --- WebSocket Endpoint (Main Data Stream) ---
+
+@app.websocket("/ws/stream")
+async def websocket_endpoint(websocket: WebSocket):
+    """WebSocket endpoint for real-time data streaming and Streamlit cache updates."""
+    await websocket.accept()
+    global ros2_bridge, recorder, latest_stream_cache
+    
+    if not ros2_bridge:
+        await websocket.close(code=1011, reason="ROS2 Bridge not initialized")
+        return
+
+    try:
+        while True:
+            # 1. Get ALL latest data (CRITICAL: Called only once per loop)
+            # This consumes the frame from the ROS2 buffer for all purposes.
+            frame, timestamp = ros2_bridge.get_latest_camera_frame()
+            lidar_data, _ = ros2_bridge.get_latest_lidar_data()
+            odom_data, _ = ros2_bridge.get_latest_odom()
+
+            # --- Encoding and Frame Caching ---
+            frame_b64 = None
+            if frame is not None:
+                # Encode frame 
+                quality = config.get('streaming', {}).get('image_quality', 85)
+                # Ensure frame is not empty before encoding (robustness check)
+                if frame.size > 0:
+                    is_success, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
+                    if is_success:
+                        frame_b64 = base64.b64encode(buffer.tobytes()).decode('utf-8')
+            
+            # 2. Prepare message (ALWAYS prepare a message, even if data is None)
+            message = {
+                "type": "frame",
+                "camera": {
+                    "data": frame_b64,  # This will be None if the camera failed
+                    "timestamp": timestamp
+                },
+                "lidar": lidar_data,
+                "odom": odom_data,
+                "recording": recorder.is_recording if recorder else False
+            }
+            
+            # 3. Update the stream cache (CRITICAL for Streamlit's /api/latest_stream_data polling)
+            latest_stream_cache = message
+            
+            # 4. Send the message to WebSocket clients (if any are connected)
+            await websocket.send_json(message)
+
+            # 5. Record frame (using the SAME frame retrieved in step 1)
+            if recorder and recorder.is_recording and ros2_bridge:
+                if frame is not None:
+                    recorder.record_frame(frame, lidar_data, odom_data, timestamp)
+            
+            # 6. Control loop rate
+            max_fps = config.get('streaming', {}).get('max_fps', 10.0)
+            await asyncio.sleep(1.0 / max_fps)
+            
+    except WebSocketDisconnect:
+        print("WebSocket client disconnected.")
+    except Exception as e:
+        print(f"WebSocket error: {e}")
+
+
+if __name__ == "__main__":
+    import uvicorn
+    # Use the application object initialized with lifespan
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+
+# ========== ./backend/fast_recorder_integrated.py ==========
+"""
+Enhanced Fast Recorder with Alert Support
+Integrates fast frame recording with metadata tracking for alerts
+"""
+import time
+import os
+import shutil
+import json
+from datetime import datetime
+from typing import Optional, Dict, Any, List
+import cv2
+import numpy as np
+from pathlib import Path
+
+
+class FastRecorder:
+    """
+    High-performance recorder that saves frames directly to disk
+    with minimal processing overhead and alert metadata tracking.
+    """
+    
+    def __init__(self, storage_path: str = "recordings"):
+        self.storage_path = Path(storage_path)
+        self.storage_path.mkdir(parents=True, exist_ok=True)
+        
+        self.is_recording = False
+        self.current_session_id: Optional[str] = None
+        self.current_session_path: Optional[Path] = None
+        self.frame_count = 0
+        self.start_time: Optional[float] = None
+        
+        # FPS tracking
+        self.fps_log: Optional[object] = None
+        self.frame_timestamps: List[float] = []
+        
+        # Alert tracking
+        self.alerts: List[Dict[str, Any]] = []
+        
+        # Performance tracking
+        self.prev_time = time.time()
+        self.fps_frame_count = 0
+        self.current_fps = 0.0
+        
+    def start_recording(self) -> str:
+        """Start a new recording session"""
+        if self.is_recording:
+            raise RuntimeError("Already recording")
+        
+        # Create session directory
+        self.current_session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.current_session_path = self.storage_path / self.current_session_id
+        self.current_session_path.mkdir(parents=True, exist_ok=True)
+        
+        # Create frames subdirectory
+        frames_dir = self.current_session_path / "frames"
+        frames_dir.mkdir(exist_ok=True)
+        
+        # Initialize tracking
+        self.frame_count = 0
+        self.start_time = time.time()
+        self.frame_timestamps = []
+        self.alerts = []
+        
+        # Open FPS log
+        fps_log_path = self.current_session_path / "frame_timestamps.txt"
+        self.fps_log = open(fps_log_path, 'w')
+        
+        self.is_recording = True
+        print(f"[FastRecorder] Recording started: {self.current_session_id}")
+        
+        return self.current_session_id
+    
+    def record_frame(self, frame: np.ndarray, metadata: Optional[Dict[str, Any]] = None) -> bool:
+        """
+        Record a single frame with optional metadata
+        
+        Args:
+            frame: OpenCV image (numpy array)
+            metadata: Optional metadata dict (lidar, odom, etc.)
+        
+        Returns:
+            True if frame was recorded successfully
+        """
+        if not self.is_recording or frame is None:
+            return False
+        
+        try:
+            current_time = time.time()
+            self.frame_count += 1
+            
+            # Log timestamp
+            self.fps_log.write(f"{current_time}\n")
+            self.fps_log.flush()  # Ensure immediate write
+            self.frame_timestamps.append(current_time)
+            
+            # Save frame (JPEG for speed)
+            frame_filename = f"frame_{self.frame_count:06d}.jpg"
+            frame_path = self.current_session_path / "frames" / frame_filename
+            
+            # Fast JPEG encoding (quality 90 for good balance)
+            cv2.imwrite(str(frame_path), frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            
+            # Save metadata if provided
+            if metadata:
+                metadata_filename = f"frame_{self.frame_count:06d}.json"
+                metadata_path = self.current_session_path / "frames" / metadata_filename
+                
+                # Add timestamp to metadata
+                metadata['timestamp'] = current_time
+                metadata['frame_number'] = self.frame_count
+                
+                with open(metadata_path, 'w') as f:
+                    json.dump(metadata, f)
+            
+            # Update FPS calculation (every 1 second)
+            self.fps_frame_count += 1
+            if current_time - self.prev_time >= 1.0:
+                self.current_fps = self.fps_frame_count / (current_time - self.prev_time)
+                self.prev_time = current_time
+                self.fps_frame_count = 0
+                print(f"[FastRecorder] Current FPS: {self.current_fps:.2f}")
+            
+            return True
+            
+        except Exception as e:
+            print(f"[FastRecorder] Error recording frame: {e}")
+            return False
+    
+    def add_alert(self, alert_type: str = "manual", description: str = "", 
+                  metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """
+        Add an alert marker to the current recording
+        
+        Args:
+            alert_type: Type of alert ("manual", "anomaly", "event", etc.)
+            description: Human-readable description
+            metadata: Additional metadata
+        
+        Returns:
+            Alert dict with timestamp and frame number
+        """
+        if not self.is_recording:
+            raise RuntimeError("Not recording")
+        
+        alert = {
+            'timestamp': time.time(),
+            'frame_number': self.frame_count,
+            'type': alert_type,
+            'description': description,
+            'metadata': metadata or {}
+        }
+        
+        self.alerts.append(alert)
+        print(f"[FastRecorder] Alert added at frame {self.frame_count}: {alert_type}")
+        
+        return alert
+    
+    def stop_recording(self) -> Dict[str, Any]:
+        """
+        Stop recording and save session metadata
+        
+        Returns:
+            Session summary dict
+        """
+        if not self.is_recording:
+            raise RuntimeError("Not recording")
+        
+        end_time = time.time()
+        duration = end_time - self.start_time
+        
+        # Close FPS log
+        self.fps_log.close()
+        
+        # Calculate average FPS
+        if len(self.frame_timestamps) > 1:
+            first_time = self.frame_timestamps[0]
+            last_time = self.frame_timestamps[-1]
+            avg_fps = len(self.frame_timestamps) / (last_time - first_time) if (last_time - first_time) > 0 else 0
+        else:
+            avg_fps = 0
+        
+        # Create session metadata
+        session_metadata = {
+            'session_id': self.current_session_id,
+            'start_time': self.start_time,
+            'end_time': end_time,
+            'duration': duration,
+            'total_frames': self.frame_count,
+            'average_fps': avg_fps,
+            'alerts': self.alerts,
+            'alert_count': len(self.alerts)
+        }
+        
+        # Save session metadata
+        metadata_path = self.current_session_path / "session_metadata.json"
+        with open(metadata_path, 'w') as f:
+            json.dump(session_metadata, f, indent=2)
+        
+        # Save alerts separately for easy access
+        if self.alerts:
+            alerts_path = self.current_session_path / "alerts.json"
+            with open(alerts_path, 'w') as f:
+                json.dump(self.alerts, f, indent=2)
+        
+        print(f"[FastRecorder] Recording stopped")
+        print(f"[FastRecorder] Total frames: {self.frame_count}")
+        print(f"[FastRecorder] Duration: {duration:.2f}s")
+        print(f"[FastRecorder] Average FPS: {avg_fps:.2f}")
+        print(f"[FastRecorder] Alerts: {len(self.alerts)}")
+        
+        self.is_recording = False
+        self.current_session_id = None
+        self.current_session_path = None
+        
+        return session_metadata
+    
+    def get_recording_status(self) -> Dict[str, Any]:
+        """Get current recording status"""
+        if not self.is_recording:
+            return {
+                'is_recording': False,
+                'session_id': None,
+                'frames_recorded': 0,
+                'duration': 0,
+                'current_fps': 0,
+                'alerts': 0
+            }
+        
+        duration = time.time() - self.start_time if self.start_time else 0
+        
+        return {
+            'is_recording': True,
+            'session_id': self.current_session_id,
+            'frames_recorded': self.frame_count,
+            'duration': duration,
+            'current_fps': self.current_fps,
+            'alerts': len(self.alerts)
+        }
+    
+    def get_sessions(self) -> List[Dict[str, Any]]:
+        """Get list of all recorded sessions"""
+        sessions = []
+        
+        for session_dir in sorted(self.storage_path.iterdir(), reverse=True):
+            if not session_dir.is_dir():
+                continue
+            
+            metadata_path = session_dir / "session_metadata.json"
+            if metadata_path.exists():
+                with open(metadata_path, 'r') as f:
+                    metadata = json.load(f)
+                    sessions.append(metadata)
+        
+        return sessions
+    
+    def get_session_metadata(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Get metadata for a specific session"""
+        session_path = self.storage_path / session_id
+        metadata_path = session_path / "session_metadata.json"
+        
+        if not metadata_path.exists():
+            return None
+        
+        with open(metadata_path, 'r') as f:
+            return json.load(f)
+    
+    def get_frame(self, session_id: str, frame_number: int) -> Optional[np.ndarray]:
+        """Load a specific frame from a session"""
+        session_path = self.storage_path / session_id
+        frame_filename = f"frame_{frame_number:06d}.jpg"
+        frame_path = session_path / "frames" / frame_filename
+        
+        if not frame_path.exists():
+            return None
+        
+        return cv2.imread(str(frame_path))
+    
+    def get_frame_metadata(self, session_id: str, frame_number: int) -> Optional[Dict[str, Any]]:
+        """Load metadata for a specific frame"""
+        session_path = self.storage_path / session_id
+        metadata_filename = f"frame_{frame_number:06d}.json"
+        metadata_path = session_path / "frames" / metadata_filename
+        
+        if not metadata_path.exists():
+            return None
+        
+        with open(metadata_path, 'r') as f:
+            return json.load(f)
+
+
+# Standalone video creation utility
+def create_video_from_session(session_id: str, storage_path: str = "recordings", 
+                              output_name: Optional[str] = None, fps: float = 30.0):
+    """
+    Create a video from a recorded session
+    
+    Args:
+        session_id: Session ID to convert
+        storage_path: Base recordings directory
+        output_name: Output video filename (default: session_id.mp4)
+        fps: Target FPS for video
+    """
+    session_path = Path(storage_path) / session_id
+    frames_dir = session_path / "frames"
+    
+    if not frames_dir.exists():
+        print(f"Error: Session {session_id} not found")
+        return
+    
+    # Get all frame files
+    frame_files = sorted([f for f in frames_dir.iterdir() if f.suffix == '.jpg'])
+    
+    if not frame_files:
+        print("Error: No frames found in session")
+        return
+    
+    # Read first frame to get dimensions
+    first_frame = cv2.imread(str(frame_files[0]))
+    height, width = first_frame.shape[:2]
+    
+    # Output filename
+    if output_name is None:
+        output_name = f"{session_id}.mp4"
+    
+    output_path = session_path / output_name
+    
+    # Initialize VideoWriter
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
+    
+    print(f"Creating video with {len(frame_files)} frames at {fps} FPS...")
+    
+    for i, frame_file in enumerate(frame_files):
+        frame = cv2.imread(str(frame_file))
+        out.write(frame)
+        
+        if (i + 1) % 100 == 0:
+            print(f"Processed {i + 1}/{len(frame_files)} frames...")
+    
+    out.release()
+    
+    print(f"Video created: {output_path}")
+    print(f"Size: {output_path.stat().st_size / 1024 / 1024:.2f} MB")
+
+
+if __name__ == "__main__":
+    # Example usage
+    print("FastRecorder Test")
+    
+    recorder = FastRecorder()
+    
+    # Start recording
+    session_id = recorder.start_recording()
+    
+    # Simulate recording frames
+    for i in range(100):
+        # Create dummy frame
+        frame = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
+        
+        # Add alert at frame 50
+        if i == 50:
+            recorder.add_alert("manual", "Test alert at frame 50")
+        
+        recorder.record_frame(frame, metadata={'frame_id': i})
+        time.sleep(0.033)  # ~30 FPS
+    
+    # Stop recording
+    summary = recorder.stop_recording()
+    print(f"\nSession summary: {summary}")
+    
+    # Create video
+    create_video_from_session(session_id)
+
+# ========== ./backend/recorder.py ==========
+import os
+import time
+import json
+import numpy as np
+import cv2
+from datetime import datetime
+from typing import Optional, Dict, Any, List
+
+class DataRecorder:
+    """Manages recording session state and saves frames/data."""
+
+    def __init__(self, base_dir: str = "recordings", config: Optional[Dict] = None):
+        self.base_dir = base_dir
+        os.makedirs(self.base_dir, exist_ok=True)
+        self._is_recording = False
+        self.current_session_id: Optional[str] = None
+        self.session_start_time: Optional[float] = None
+        self.frame_count = 0
+        self.session_path: Optional[str] = None
+        self.session_metadata: Dict[str, Any] = {}
+        # Configuration is stored but not actively used in this simple implementation
+        self.config = config if config is not None else {}
+
+    @property
+    def is_recording(self) -> bool:
+        return self._is_recording
+
+    def start_recording(self) -> Optional[str]:
+        if self._is_recording:
+            return self.current_session_id
+
+        self.session_start_time = time.time()
+        # Create a unique session ID based on timestamp
+        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.current_session_id = f"session_{timestamp_str}"
+        
+        # Structure: <base_dir>/<session_id>/
+        #   - metadata.json
+        #   - frames/frame_00000.jpg
+        #   - sensor_data/frame_00000.json
+        self.session_path = os.path.join(self.base_dir, self.current_session_id)
+        self.frames_path = os.path.join(self.session_path, "frames")
+        self.sensor_path = os.path.join(self.session_path, "sensor_data")
+        
+        os.makedirs(self.frames_path, exist_ok=True)
+        os.makedirs(self.sensor_path, exist_ok=True)
+
+        self.frame_count = 0
+        self.session_metadata = {
+            "session_id": self.current_session_id,
+            "start_time": self.session_start_time,
+            "end_time": None,
+            "frame_count": 0,
+            "frames": []
+        }
+        
+        self._is_recording = True
+        return self.current_session_id
+
+    def stop_recording(self) -> bool:
+        if not self._is_recording:
+            return True
+
+        self.session_metadata["end_time"] = time.time()
+        self.session_metadata["frame_count"] = self.frame_count
+        
+        # Save metadata file
+        metadata_path = os.path.join(self.session_path, "metadata.json")
+        with open(metadata_path, 'w') as f:
+            json.dump(self.session_metadata, f, indent=4)
+            
+        self._is_recording = False
+        self.current_session_id = None
+        return True
+
+    def record_frame(self, frame: np.ndarray, lidar_data: Optional[Dict], odom_data: Optional[Dict], timestamp: float):
+        if not self._is_recording or frame is None:
+            return
+
+        # Ensure paths are set
+        if not self.frames_path or not self.sensor_path:
+            return
+
+        frame_id = f"frame_{self.frame_count:05d}"
+        
+        # 1. Save Camera Frame (JPEG)
+        frame_filename = os.path.join(self.frames_path, f"{frame_id}.jpg")
+        cv2.imwrite(frame_filename, frame) 
+
+        # 2. Save Sensor Data (JSON)
+        sensor_data = {
+            "timestamp": timestamp,
+            "lidar": lidar_data,
+            "odom": odom_data,
+        }
+        sensor_filename = os.path.join(self.sensor_path, f"{frame_id}.json")
+        with open(sensor_filename, 'w') as f:
+            json.dump(sensor_data, f, indent=4)
+
+        # 3. Update Session Metadata
+        self.session_metadata["frames"].append({
+            "frame_id": frame_id,
+            "timestamp": timestamp,
+            "filename": os.path.relpath(frame_filename, self.session_path), # Store relative path
+        })
+        
+        self.frame_count += 1
+        
+    def get_session_info(self) -> Dict:
+        """Returns metadata for the current session."""
+        if self._is_recording:
+            duration = time.time() - self.session_start_time
+            return {
+                "session_id": self.current_session_id,
+                "frame_count": self.frame_count,
+                "duration": duration
+            }
+        return {}
+
+    def list_sessions(self) -> List[Dict]:
+        """Lists all recorded sessions with summary info."""
+        sessions = []
+        for item in os.listdir(self.base_dir):
+            session_path = os.path.join(self.base_dir, item)
+            if os.path.isdir(session_path) and item.startswith("session_"):
+                metadata_path = os.path.join(session_path, "metadata.json")
+                if os.path.exists(metadata_path):
+                    try:
+                        with open(metadata_path, 'r') as f:
+                            metadata = json.load(f)
+                            sessions.append({
+                                "session_id": metadata["session_id"],
+                                "start_time": metadata["start_time"],
+                                "frame_count": metadata.get("frame_count", len(metadata["frames"])),
+                                "duration": metadata.get("end_time", time.time()) - metadata["start_time"],
+                            })
+                    except Exception:
+                        pass
+        return sessions
+
+    def load_session(self, session_id: str) -> Optional[Dict]:
+        """Loads full metadata for a specific session."""
+        session_path = os.path.join(self.base_dir, session_id)
+        metadata_path = os.path.join(session_path, "metadata.json")
+        if os.path.exists(metadata_path):
+            with open(metadata_path, 'r') as f:
+                return json.load(f)
+        return None
+
+    # Helper for the API to fetch files from the new structure
+    def get_frame_file_path(self, session_id: str, frame_id: str) -> Optional[str]:
+        """Gets the file path for a specific camera frame."""
+        file_path = os.path.join(self.base_dir, session_id, "frames", f"{frame_id}.jpg")
+        return file_path if os.path.exists(file_path) else None
+
+    def get_sensor_data_file_path(self, session_id: str, frame_id: str) -> Optional[str]:
+        """Gets the file path for sensor data."""
+        file_path = os.path.join(self.base_dir, session_id, "sensor_data", f"{frame_id}.json")
+        return file_path if os.path.exists(file_path) else None
+# ========== ./backend/camera_node.py ==========
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import Image
+from cv_bridge import CvBridge
+import cv2
+import sys
+from typing import Dict, Any
+
+# Configuration defaults
+DEFAULT_VIDEO_SOURCE = 0
+DEFAULT_FPS = 30  # Increased from 15 for smoother video
+TOPIC_NAME = '/camera/raw_image'
+
+class CameraNode(Node):
+    """
+    ROS 2 Node to capture video frames using OpenCV and publish them as Image messages.
+    """
+    def __init__(self, config: Dict[str, Any]):
+        super().__init__('camera_publisher')
+        
+        # Load configuration
+        camera_config = config.get('camera', {})
+        video_source = camera_config.get('video_source', DEFAULT_VIDEO_SOURCE)
+        fps = camera_config.get('fps', DEFAULT_FPS)
+        
+        self.publisher_ = self.create_publisher(Image, TOPIC_NAME, 10)
+        self.bridge = CvBridge()
+        
+        # Initialize video capture
+        self.cap = cv2.VideoCapture(video_source)
+        
+        # Performance optimizations
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Minimal buffer to reduce latency
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)  # Fixed resolution
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        
+        if not self.cap.isOpened():
+            self.get_logger().error(f"Failed to open video source {video_source}. Exiting.")
+            # Note: Do not exit the process here, just stop attempting to capture
+            self.is_active = False
+            return
+        
+        self.is_active = True
+        
+        # Set frame rate
+        self.cap.set(cv2.CAP_PROP_FPS, fps)
+        
+        self.timer_period = 1.0 / fps  # seconds
+        self.timer = self.create_timer(self.timer_period, self.timer_callback)
+        self.get_logger().info(f'Camera Publisher started, publishing to {TOPIC_NAME} at {fps} FPS')
+
+    def timer_callback(self):
+        if not self.is_active:
+            return
+            
+        ret, frame = self.cap.read()
+
+        if ret:
+            # Convert the frame to a ROS 2 Image message
+            img_msg = self.bridge.cv2_to_imgmsg(frame, encoding="bgr8")
+            # Set timestamp
+            img_msg.header.stamp = self.get_clock().now().to_msg()
+            
+            self.publisher_.publish(img_msg)
+        else:
+            self.get_logger().warn('Failed to read frame from camera')
+
+    def stop_camera(self):
+        """Releases the camera resource."""
+        if self.is_active:
+            self.cap.release()
+            self.get_logger().info('Camera resource released.')
+            self.is_active = False
+
+# Note: main function removed as this is now imported and managed by app.py
+# ========== ./frontend/__init__.py ==========
+# Frontend package for Yahboom Dashboard
+
+
+# ========== ./frontend/dashboard.py ==========
+"""
+Yahboom Dashboard - Streamlit Frontend
+Real-Time Robotic Control & Replay System
+"""
+# IMPORTANT: Configure logging BEFORE importing Streamlit
+import logging
+import warnings
+import sys
+
+# Suppress Streamlit media file storage warnings (harmless cache lookup errors)
+logging.getLogger('streamlit.runtime.media_file_storage').setLevel(logging.CRITICAL)
+logging.getLogger('streamlit.web.server.media_file_handler').setLevel(logging.CRITICAL)
+logging.getLogger('streamlit.runtime').setLevel(logging.ERROR)
+logging.getLogger('streamlit.web').setLevel(logging.ERROR)
+logging.getLogger('streamlit').setLevel(logging.ERROR)
+
+warnings.filterwarnings('ignore', category=UserWarning)
+warnings.filterwarnings('ignore', category=RuntimeWarning)
+
+# Create a filter to suppress MediaFileStorageError messages
+class MediaFileErrorFilter(logging.Filter):
+    def filter(self, record):
+        try:
+            msg = str(record.getMessage())
+            return not any([
+                'MediaFileStorageError' in msg,
+                'media_file_storage' in msg.lower(),
+                'media_file_handler' in msg.lower(),
+                'Bad filename' in msg,
+                'Missing file' in msg,
+                ('KeyError' in msg and 'media' in msg.lower())
+            ])
+        except:
+            return True
+
+# Apply filter to all relevant loggers
+for logger_name in ['streamlit', 'streamlit.runtime', 'streamlit.web', 'root']:
+    logger = logging.getLogger(logger_name if logger_name != 'root' else '')
+    logger.addFilter(MediaFileErrorFilter())
+    if logger_name != 'root':
+        logger.setLevel(logging.ERROR)
+
+# Now import Streamlit and other modules
+import streamlit as st
+import requests
+import json
+import time
+from datetime import datetime, timedelta
+from typing import Optional, Dict, Any
+import plotly.graph_objects as go
+import plotly.express as px
+import numpy as np
+from PIL import Image
+import io
+import base64
+
+# Configuration
+BACKEND_URL = "http://localhost:8000"
+REFRESH_INTERVAL = 0.033  # 33ms for smooth updates (30 FPS) - Optimized from 0.1
+
+# Page configuration
+st.set_page_config(
+    page_title="Yahboom Dashboard",
+    page_icon="🤖",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Custom CSS for dark technical theme and stability fix
+st.markdown("""
+<style>
+    /* Dark theme styling */
+    .main {
+        background-color: #0a0e27;
+        color: #e0e0e0;
+    }
+    
+    .stApp {
+        background: linear-gradient(180deg, #0a0e27 0%, #1a1f3a 100%);
+    }
+    
+    /* Camera feed container styling */
+    div[data-testid="column"] {
+        background-color: rgba(10, 14, 39, 0.8);
+        border-radius: 8px;
+    }
+    
+    /* Image container with cyan border */
+    div[data-testid="stImage"] {
+        border: 2px solid #00ffff;
+        border-radius: 8px;
+        padding: 10px;
+        background-color: rgba(0, 0, 0, 0.3);
+        max-height: 540px;
+        overflow: hidden;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+    
+    /* Actual image styling - contained within border */
+    div[data-testid="stImage"] > img {
+        max-height: 500px;
+        max-width: 100%;
+        width: auto !important;
+        height: auto !important;
+        object-fit: contain;
+        display: block;
+        margin: 0 auto;
+    }
+    
+    /* Warning/error messages */
+    .stWarning, .stError {
+        text-align: center;
+        padding: 20px;
+        border-radius: 8px;
+    }
+    
+    /* LiDAR/SLAM container with red outline */
+    div[data-testid="stVerticalBlock"]:has(div[data-testid="stPlotlyChart"]) {
+        border: 2px solid #ff0000;
+        border-radius: 8px;
+        padding: 10px;
+        background-color: rgba(0, 0, 0, 0.3);
+    }
+    
+    /* Plotly chart container styling */
+    div[data-testid="stPlotlyChart"] {
+        border-radius: 4px;
+    }
+    
+    /* Tabs styling for LiDAR/SLAM */
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 8px;
+    }
+    
+    .stTabs [data-baseweb="tab"] {
+        background-color: rgba(255, 255, 255, 0.05);
+        border-radius: 4px;
+        padding: 8px 16px;
+    }
+    
+    .stTabs [aria-selected="true"] {
+        background-color: rgba(255, 0, 0, 0.2);
+        border-bottom: 2px solid #ff0000;
+    }
+    
+    /* ALERT Button styling */
+    button[kind="primary"] {
+        background-color: #ff0000 !important;
+        color: white !important;
+        font-weight: bold !important;
+        font-size: 18px !important;
+        padding: 12px !important;
+        border: 2px solid #ff4444 !important;
+        box-shadow: 0 0 10px rgba(255, 0, 0, 0.5) !important;
+    }
+    
+    button[kind="primary"]:hover {
+        background-color: #cc0000 !important;
+        box-shadow: 0 0 20px rgba(255, 0, 0, 0.8) !important;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+## Live Data Streaming Functions
+
+def get_latest_stream_data() -> Optional[Dict]:
+    """
+    Get the latest aggregated data (camera, lidar, odom, status) from the backend's
+    internal stream buffer via the polling endpoint.
+    """
+    try:
+        # Uses the new polling endpoint added to app.py
+        response = requests.get(f"{BACKEND_URL}/api/latest_stream_data", timeout=0.5)
+        if response.status_code == 200:
+            return response.json()
+    except Exception:
+        # Silently fail for fast polling
+        pass
+    return None
+
+def process_camera_data(camera_data: Dict) -> Optional[np.ndarray]:
+    """
+    Process base64 image data from the aggregated stream message into a numpy array.
+    """
+    if camera_data and 'data' in camera_data and camera_data['data'] is not None:
+        try:
+            image_bytes = base64.b64decode(camera_data["data"])
+            img = Image.open(io.BytesIO(image_bytes))
+            # Convert PIL Image to numpy array (RGB format)
+            img_array = np.array(img)
+            # Ensure it's RGB
+            if len(img_array.shape) == 3 and img_array.shape[2] == 4:
+                img_array = img_array[:, :, :3]
+            return img_array
+        except Exception:
+            pass
+    return None
+
+# The rest of the API/Helper functions (get_status, start_recording, visualize_lidar, etc.) 
+# remain the same as they correctly target the FastAPI REST endpoints.
+
+def check_backend_connection() -> bool:
+    """Check if backend is available"""
+    try:
+        response = requests.get(f"{BACKEND_URL}/api/status", timeout=2) 
+        return response.status_code == 200
+    except:
+        return False
+
+def get_status() -> Optional[Dict]:
+    """Get system status from backend"""
+    try:
+        response = requests.get(f"{BACKEND_URL}/api/status", timeout=2)
+        if response.status_code == 200:
+            return response.json()
+    except Exception:
+        pass
+    return None
+
+def start_recording() -> bool:
+    """Start recording session"""
+    try:
+        response = requests.post(f"{BACKEND_URL}/api/recording/start", timeout=2)
+        return response.status_code == 200
+    except:
+        return False
+
+
+def stop_recording() -> bool:
+    """Stop recording session"""
+    try:
+        response = requests.post(f"{BACKEND_URL}/api/recording/stop", timeout=2)
+        return response.status_code == 200
+    except:
+        return False
+
+
+def add_alert(description: str = "", alert_type: str = "manual") -> bool:
+    """Add alert to current recording"""
+    try:
+        response = requests.post(
+            f"{BACKEND_URL}/api/recording/alert",
+            json={
+                "type": alert_type,
+                "description": description,
+                "metadata": {}
+            },
+            timeout=2
+        )
+        return response.status_code == 200
+    except:
+        return False
+
+
+def list_recording_sessions() -> list:
+    """List all recording sessions"""
+    try:
+        response = requests.get(f"{BACKEND_URL}/api/recording/sessions", timeout=2)
+        if response.status_code == 200:
+            return response.json().get('sessions', [])
+    except:
+        pass
+    return []
+
+
+def get_session_data(session_id: str) -> Optional[Dict]:
+    """Get session metadata"""
+    try:
+        response = requests.get(f"{BACKEND_URL}/api/recording/session/{session_id}", timeout=2)
+        if response.status_code == 200:
+            return response.json()
+    except:
+        pass
+    return None
+
+
+def get_frame_from_session(session_id: str, frame_id: str) -> Optional[np.ndarray]:
+    """Get a specific frame from a session as numpy array (Replay mode)"""
+    try:
+        # This endpoint returns raw image bytes
+        response = requests.get(f"{BACKEND_URL}/api/recording/session/{session_id}/frame/{frame_id}", timeout=5)
+        if response.status_code == 200:
+            img = Image.open(io.BytesIO(response.content))
+            img_array = np.array(img)
+            if len(img_array.shape) == 3 and img_array.shape[2] == 4:
+                img_array = img_array[:, :, :3]
+            return img_array
+        if response.status_code == 404:
+            return None
+    except Exception:
+        pass
+    return None
+
+
+def get_lidar_from_session(session_id: str, frame_id: str) -> Optional[Dict]:
+    """Get LiDAR data for a specific frame from a session (Replay mode)"""
+    try:
+        response = requests.get(f"{BACKEND_URL}/api/recording/session/{session_id}/lidar/{frame_id}", timeout=2)
+        if response.status_code == 200:
+            return response.json()
+    except:
+        pass
+    return None
+
+def get_latest_map_image() -> Optional[Dict[str, Any]]:
+    """Get latest SLAM map image and metadata from backend (retained as it's a separate entity)."""
+    try:
+        response = requests.get(f"{BACKEND_URL}/api/map/latest", timeout=2)
+        if response.status_code == 200:
+            payload = response.json()
+            map_payload = payload.get("map")
+            if map_payload and map_payload.get("image"):
+                image_bytes = base64.b64decode(map_payload["image"])
+                image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+                map_payload["image_object"] = image
+                return map_payload
+    except:
+        pass
+    return None
+
+def visualize_lidar(lidar_data: Dict) -> go.Figure:
+    """Create LiDAR visualization"""
+    if not lidar_data or 'ranges' not in lidar_data or not lidar_data['ranges']:
+        return None
+    
+    data = lidar_data
+    ranges = np.array(data.get('ranges', []))
+    angles = np.array(data.get('angles', []))
+    
+    # Filter invalid ranges
+    valid_mask = (ranges > data.get('range_min', 0)) & (ranges < data.get('range_max', 30))
+    
+    # Apply filter to both arrays
+    angles = angles[valid_mask]
+    ranges = ranges[valid_mask]
+
+    
+    # Convert to Cartesian
+    x = ranges * np.cos(angles)
+    y = ranges * np.sin(angles)
+    
+    # Create scatter plot
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=x,
+        y=y,
+        mode='markers',
+        marker=dict(
+            size=3,
+            color=ranges,
+            colorscale='Viridis',
+            showscale=True,
+            colorbar=dict(title="Range (m)")
+        ),
+        name='LiDAR Scan'
+    ))
+    
+    # Add robot position (origin)
+    fig.add_trace(go.Scatter(
+        x=[0],
+        y=[0],
+        mode='markers',
+        marker=dict(size=15, color='cyan', symbol='circle'),
+        name='Robot'
+    ))
+    
+    fig.update_layout(
+        title="LiDAR Scan Visualization",
+        xaxis_title="X (m)",
+        yaxis_title="Y (m)",
+        template="plotly_dark",
+        height=500,
+        showlegend=True,
+        plot_bgcolor='#0a0e27',
+        paper_bgcolor='#0a0e27',
+        font=dict(color='#e0e0e0')
+    )
+    
+    # Set equal aspect ratio
+    fig.update_xaxes(scaleanchor="y", scaleratio=1, range=[-3, 3])
+    fig.update_yaxes(range=[-3, 3])
+    
+    return fig
+
+
+def visualize_odom(odom_data: Dict) -> Dict[str, float]:
+    """Extract odometry metrics"""
+    if not odom_data or 'position' not in odom_data:
+        return {}
+    
+    # Data is expected to be under 'data' key if fetched via API. 
+    # Since it's from stream_data, it's the raw dictionary.
+    data = odom_data 
+    pos = data.get('position', {})
+    vel = data.get('linear_velocity', {})
+    
+    # Assuming z-rotation (yaw) is not available in the simple odom data, 
+    # but still calculate position and speed.
+    
+    return {
+        'x': pos.get('x', 0),
+        'y': pos.get('y', 0),
+        'z': pos.get('z', 0),
+        'vx': vel.get('x', 0),
+        'vy': vel.get('y', 0),
+        'speed': np.sqrt(vel.get('x', 0)**2 + vel.get('y', 0)**2)
+    }
+
+# Initialize session state (retained from previous iteration)
+if 'recording' not in st.session_state:
+    st.session_state.recording = False
+if 'playback_mode' not in st.session_state:
+    st.session_state.playback_mode = False
+if 'selected_session' not in st.session_state:
+    st.session_state.selected_session = None
+if 'current_frame_idx' not in st.session_state:
+    st.session_state.current_frame_idx = 0
+if 'camera_enabled' not in st.session_state:
+    st.session_state.camera_enabled = True
+if 'lidar_enabled' not in st.session_state:
+    st.session_state.lidar_enabled = True
+if 'cached_session_data' not in st.session_state:
+    st.session_state.cached_session_data = {}
+if 'last_loaded_frame' not in st.session_state:
+    st.session_state.last_loaded_frame = None
+if 'cached_frames' not in st.session_state:
+    st.session_state.cached_frames = {}
+if 'failed_frames' not in st.session_state:
+    st.session_state.failed_frames = set()
+if 'enable_frame_cache' not in st.session_state:
+    st.session_state.enable_frame_cache = False
+
+
+# Main dashboard
+st.title("🤖 Yahboom Dashboard")
+st.markdown("---")
+
+# Sidebar controls
+with st.sidebar:
+    st.header("🎛️ Control Panel")
+    
+    # Backend status
+    backend_connected = check_backend_connection()
+    status_icon = "🟢" if backend_connected else "🔴"
+    st.markdown(f"**Backend Status:** {status_icon} {'Connected' if backend_connected else 'Disconnected'}")
+    
+    if not backend_connected:
+        st.error("⚠️ Cannot connect to backend. Please ensure the FastAPI server is running.")
+        st.stop()
+    
+    # Get system status
+    status = get_status()
+    
+    # Recording controls
+    st.subheader("📹 Recording")
+    recording_status = status.get('recording', False) if status else False
+    status_indicator = "🟢" if recording_status else "🟡"
+    st.markdown(f"**Status:** {status_indicator} {'Recording' if recording_status else 'Idle'}")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("▶️ Start", disabled=recording_status, use_container_width=True):
+            if start_recording():
+                st.success("Recording started")
+                st.rerun()
+    
+    with col2:
+        if st.button("⏹️ Stop", disabled=not recording_status, use_container_width=True):
+            if stop_recording():
+                st.success("Recording stopped")
+                st.rerun()
+    
+    # Display mode
+    st.subheader("🎬 Display Mode")
+    display_mode = st.radio(
+        "Mode",
+        ["Live", "Replay"],
+        index=0 if not st.session_state.playback_mode else 1,
+        label_visibility="collapsed"
+    )
+    st.session_state.playback_mode = (display_mode == "Replay")
+    
+    # Stream controls
+    st.subheader("📡 Stream Controls")
+    st.session_state.camera_enabled = st.checkbox("📷 Camera Feed", value=st.session_state.camera_enabled)
+    st.session_state.lidar_enabled = st.checkbox("📡 LiDAR/SLAM Map", value=st.session_state.lidar_enabled)
+    
+    # System metrics
+    if status:
+        st.subheader("📊 System Metrics")
+        # Note: Status check is now based on active topics, not just 'is_connected'
+        st.metric("ROS2", "🟢 Active" if status.get('ros2_connected') else "🔴 Inactive")
+        st.metric("Camera", "🟢 Active" if status.get('camera_available') else "🔴 Inactive")
+        st.metric("LiDAR", "🟢 Active" if status.get('lidar_available') else "🔴 Inactive")
+        st.metric("Map", "🟢 Active" if status.get('map_available') else "🔴 Inactive")
+        
+        if recording_status and status.get('recording_session'):
+            session_info = status['recording_session']
+            st.metric("Frames Recorded", f"{session_info.get('frame_count', 0):,}")
+            duration = session_info.get('duration', 0)
+            st.metric("Duration", f"{duration:.1f}s")
+
+
+# Main content area
+if st.session_state.playback_mode:
+    # --- Replay Mode (Retained) ---
+    st.header("📼 Replay Mode")
+    
+    # ... (Replay logic remains the same) ...
+    
+    # Simplified Replay Logic Placeholder (Full code should be used)
+    sessions = list_recording_sessions()
+
+    # ⭐ ADD THE PRINT STATEMENT HERE ⭐
+    print(f"DEBUG: Sessions data returned by API: {sessions}", file=sys.stderr)
+
+    if sessions:
+        # FIX: Use 'sessions' variable and keys 'session_id', 'total_frames', and 'duration'
+        session_options = {s['session_id']: f"{s['session_id']} ({s.get('total_frames', 0)} frames, {s.get('duration', 0):.1f}s)"
+                           for s in sessions}
+        selected_session_id = st.selectbox(
+            "Select Recording Session",
+            options=list(session_options.keys()),
+            format_func=lambda x: session_options[x]
+        )
+        
+        if selected_session_id:
+            cache_key = f"session_{selected_session_id}"
+            if cache_key not in st.session_state.cached_session_data:
+                session_data = get_session_data(selected_session_id)
+                st.session_state.cached_session_data[cache_key] = session_data
+            else:
+                session_data = st.session_state.cached_session_data[cache_key]
+            
+            if st.session_state.selected_session != selected_session_id:
+                st.session_state.current_frame_idx = 0
+                st.session_state.selected_session = selected_session_id
+                st.session_state.last_loaded_frame = None
+                st.session_state.cached_frames = {}
+                st.session_state.failed_frames = set()
+            
+            if session_data:
+                # Generate frames list from total_frames (API returns total_frames, not frames array)
+                total_frames = session_data.get('total_frames', 0)
+                if total_frames > 0:
+                    # Create list of frame dictionaries matching the expected format
+                    # Frame files are named: frame_000001.jpg, frame_000002.jpg, etc.
+                    frames = [
+                        {
+                            'frame_id': f"frame_{i:06d}",
+                            'timestamp': session_data.get('start_time', 0) + (i-1) * (session_data.get('duration', 0) / total_frames)
+                        }
+                        for i in range(1, total_frames + 1)
+                    ]
+                else:
+                    frames = []
+                
+                if frames:
+                    st.subheader("⏱️ Timeline")
+                    max_idx = len(frames) - 1
+                    
+                    col_reset, col_cache, col_info = st.columns([1, 1, 2])
+                    with col_reset:
+                        if st.button("🔄 Reset", help="Reset to first frame and clear cache"):
+                            st.session_state.current_frame_idx = 0
+                            st.session_state.last_loaded_frame = None
+                            st.session_state.cached_frames = {}
+                            st.session_state.failed_frames = set()
+                            st.rerun()
+                    with col_cache:
+                        st.session_state.enable_frame_cache = st.checkbox(
+                            "💾 Cache Frames", 
+                            value=st.session_state.enable_frame_cache,
+                            help="Enable frame caching (uses more memory but faster navigation)"
+                        )
+                    
+                    frame_idx = st.slider(
+                        "Frame",
+                        0,
+                        max_idx,
+                        value=st.session_state.current_frame_idx,
+                        key="frame_slider"
+                    )
+                    st.session_state.current_frame_idx = frame_idx
+                    
+                    current_frame = frames[frame_idx]
+                    frame_time = datetime.fromtimestamp(current_frame['timestamp'])
+                    st.markdown(f"**Timestamp:** `{frame_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}` | **Frame:** {frame_idx + 1}/{len(frames)}")
+                    
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        if st.session_state.camera_enabled:
+                            st.subheader("📷 Camera Feed")
+                            frame_id = current_frame['frame_id']
+                            camera_placeholder = st.empty()
+                            
+                            frame_cache_key = f"{selected_session_id}_{frame_id}"
+                            frame_img = None
+                            
+                            if st.session_state.enable_frame_cache and frame_cache_key in st.session_state.cached_frames:
+                                frame_img = st.session_state.cached_frames[frame_cache_key]
+                            
+                            if frame_img is None:
+                                if frame_cache_key not in st.session_state.failed_frames:
+                                    try:
+                                        frame_img = get_frame_from_session(selected_session_id, frame_id)
+                                        if frame_img is not None:
+                                            if st.session_state.enable_frame_cache:
+                                                st.session_state.cached_frames[frame_cache_key] = frame_img
+                                            st.session_state.failed_frames.discard(frame_cache_key)
+                                        else:
+                                            st.session_state.failed_frames.add(frame_cache_key)
+                                    except Exception:
+                                        st.session_state.failed_frames.add(frame_cache_key)
+                            
+                            if frame_img is not None:
+                                camera_placeholder.image(frame_img, use_container_width=True)
+                            else:
+                                camera_placeholder.warning(f"⚠️ Frame {frame_id} not available or failed to load")
+                        else:
+                            st.info("Camera feed disabled")
+                    
+                    with col2:
+                        if st.session_state.lidar_enabled:
+                            st.subheader("📡 LiDAR/SLAM Map")
+                            lidar_placeholder = st.empty()
+                            
+                            try:
+                                frame_id = current_frame['frame_id']
+                                lidar_data = get_lidar_from_session(selected_session_id, frame_id)
+                                if lidar_data:
+                                    fig = visualize_lidar(lidar_data)
+                                    if fig:
+                                        lidar_placeholder.plotly_chart(fig, use_container_width=True)
+                                    else:
+                                        lidar_placeholder.warning("Could not visualize LiDAR data")
+                                else:
+                                    lidar_placeholder.warning("No LiDAR data for this frame")
+                            except Exception:
+                                lidar_placeholder.error("Error loading LiDAR data")
+                        else:
+                            st.info("LiDAR map disabled")
+                else:
+                    st.warning("No frames in this session")
+            else:
+                st.error("Could not load session data")
+    else:
+        st.info("No recording sessions available. Start recording to create sessions.")
+
+else:
+    # --- Live Mode (Updated for Polling and Stability) ---
+    st.header("🔴 Live Monitoring")
+    
+    # Fetch aggregated stream data once per rerun
+    stream_data = get_latest_stream_data()
+    
+    # Extract components
+    camera_data = stream_data.get('camera', {}) if stream_data else {}
+    lidar_data = stream_data.get('lidar', {}) if stream_data else {}
+    odom_data = stream_data.get('odom', {}) if stream_data else {}
+    
+    # Status bar
+    col1, col2, col3, col4, col5 = st.columns(5)
+    with col1:
+        is_recording = stream_data.get('recording', False) if stream_data else status.get('recording', False)
+        status_icon = "🟢 Recording" if is_recording else "🟡 Idle"
+        st.markdown(f"**Status:** {status_icon}")
+    with col2:
+        camera_status = "🟢" if camera_data.get('data') else "🔴"
+        st.markdown(f"**Camera:** {camera_status}")
+    with col3:
+        lidar_status = "🟢" if lidar_data else "🔴"
+        st.markdown(f"**LiDAR:** {lidar_status}")
+    with col4:
+        map_status = "🟢" if status.get('map_available') else "🔴"
+        st.markdown(f"**Map:** {map_status}")
+    with col5:
+        current_time = datetime.now().strftime("%H:%M:%S")
+        st.markdown(f"**Time:** `{current_time}`")
+    
+    # Main display area
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        if st.session_state.camera_enabled:
+            st.subheader("📷 Live Camera Feed")
+            
+            # Process and display latest frame from the aggregated stream data
+            camera_frame = process_camera_data(camera_data)
+            
+            # --- Display Logic ---
+            if camera_frame is not None:
+                # ✅ FIXED: Direct image display without custom HTML container
+                st.image(camera_frame, use_container_width=True)
+            else:
+                # 2. Frame missing: Display warning
+                st.warning("⚠️ NO CAMERA FEED AVAILABLE")
+            
+            # Timestamp below the image
+            frame_timestamp = camera_data.get('timestamp')
+            if frame_timestamp:
+                try:
+                    time_str = datetime.fromtimestamp(frame_timestamp).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+                    st.caption(f"🕐 {time_str}")
+                except:
+                    st.caption(f"🕐 Stream updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}")
+            else:
+                st.caption(f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}")
+            
+            # ALERT Button (only visible when recording)
+            if recording_status:
+                st.markdown("<br>", unsafe_allow_html=True)
+                if st.button("🚨 ALERT", type="primary", use_container_width=True, key="alert_button"):
+                    if add_alert(description="Manual alert from dashboard"):
+                        st.success("✅ Alert added!")
+                        time.sleep(0.5)
+                        st.rerun()
+                    else:
+                        st.error("❌ Failed to add alert")
+
+        else:
+            st.info("📷 Camera feed disabled")
+    
+    with col2:
+        if st.session_state.lidar_enabled:
+            st.subheader("📡 LiDAR/SLAM Map")
+            # ✅ SWAPPED: Laser Scan first, SLAM Map second
+            scan_tab, map_tab = st.tabs(["🔴 Laser Scan", "🗺️ SLAM Map"])
+            
+            with scan_tab:
+                # LiDAR Laser Scan visualization
+                if lidar_data:
+                    fig = visualize_lidar(lidar_data)
+                    if fig:
+                        st.plotly_chart(fig, use_container_width=True)
+                    else:
+                        st.warning("⚠️ Could not visualize LiDAR data")
+                else:
+                    st.warning("⚠️ No LiDAR data available in stream")
+            
+            with map_tab:
+                # SLAM Map visualization
+                map_payload = get_latest_map_image()
+                if map_payload and map_payload.get("image_object"):
+                    st.image(map_payload["image_object"], use_container_width=True)
+                    resolution = map_payload.get("resolution")
+                    timestamp = map_payload.get("timestamp")
+                    if resolution:
+                        st.caption(f"🗺️ Resolution: {resolution:.2f} m/pixel")
+                    if timestamp:
+                        try:
+                            map_time = datetime.fromtimestamp(timestamp)
+                            st.caption(f"🕐 Map updated: {map_time.strftime('%Y-%m-%d %H:%M:%S')}")
+                        except Exception:
+                            pass
+                else:
+                    st.warning("⚠️ No SLAM map available")
+        else:
+            st.info("📡 LiDAR map disabled")
+    
+    # 🚧 Odometry metrics - TO BE ENHANCED LATER
+    # The robot has: tf, odom, imu, map, scan topics available
+    # Future enhancement: Full odometry visualization with trajectory, IMU data, etc.
+    st.subheader("📊 Odometry (Basic)")
+    if odom_data:
+        metrics = visualize_odom(odom_data)
+        if metrics:
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Position X", f"{metrics.get('x', 0):.2f} m")
+            with col2:
+                st.metric("Position Y", f"{metrics.get('y', 0):.2f} m")
+            with col3:
+                st.metric("Speed", f"{metrics.get('speed', 0):.2f} m/s")
+            with col4:
+                # 🚧 TODO: Add heading from IMU/TF data
+                st.metric("Heading", f"N/A") 
+    else:
+        st.info("ℹ️ Odometry visualization will be enhanced in next version")
+
+# Auto-refresh for live mode
+if not st.session_state.playback_mode:
+    time.sleep(REFRESH_INTERVAL)
+    st.rerun()
+
+# ========== ./frontend/backup/1-dashboard.py ==========
+"""
+Yahboom Dashboard - Streamlit Frontend
+Real-Time Robotic Control & Replay System
+"""
+# IMPORTANT: Configure logging BEFORE importing Streamlit
+import logging
+import warnings
+import sys
+
+# Suppress Streamlit media file storage warnings (harmless cache lookup errors)
+logging.getLogger('streamlit.runtime.media_file_storage').setLevel(logging.CRITICAL)
+logging.getLogger('streamlit.web.server.media_file_handler').setLevel(logging.CRITICAL)
+logging.getLogger('streamlit.runtime').setLevel(logging.ERROR)
+logging.getLogger('streamlit.web').setLevel(logging.ERROR)
+logging.getLogger('streamlit').setLevel(logging.ERROR)
+
+warnings.filterwarnings('ignore', category=UserWarning)
+warnings.filterwarnings('ignore', category=RuntimeWarning)
+
+# Create a filter to suppress MediaFileStorageError messages
+class MediaFileErrorFilter(logging.Filter):
+    def filter(self, record):
+        try:
+            msg = str(record.getMessage())
+            return not any([
+                'MediaFileStorageError' in msg,
+                'media_file_storage' in msg.lower(),
+                'media_file_handler' in msg.lower(),
+                'Bad filename' in msg,
+                'Missing file' in msg,
+                ('KeyError' in msg and 'media' in msg.lower())
+            ])
+        except:
+            return True
+
+# Apply filter to all relevant loggers
+for logger_name in ['streamlit', 'streamlit.runtime', 'streamlit.web', 'root']:
+    logger = logging.getLogger(logger_name if logger_name != 'root' else '')
+    logger.addFilter(MediaFileErrorFilter())
+    if logger_name != 'root':
+        logger.setLevel(logging.ERROR)
+
+# Now import Streamlit and other modules
+import streamlit as st
+import requests
+import json
+import time
+from datetime import datetime, timedelta
+from typing import Optional, Dict, Any
+import plotly.graph_objects as go
+import plotly.express as px
+import numpy as np
+from PIL import Image
+import io
+import base64
+
+# Configuration
+BACKEND_URL = "http://localhost:8000"
+REFRESH_INTERVAL = 0.1  # 100ms for smooth updates (10 FPS)
+
+# Page configuration
+st.set_page_config(
+    page_title="Yahboom Dashboard",
+    page_icon="🤖",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Custom CSS for dark technical theme and stability fix
+st.markdown("""
+<style>
+    /* Dark theme styling */
+    .main {
+        background-color: #0a0e27;
+        color: #e0e0e0;
+    }
+    
+    .stApp {
+        background: linear-gradient(180deg, #0a0e27 0%, #1a1f3a 100%);
+    }
+    
+    /* Camera feed container styling */
+    div[data-testid="column"] {
+        background-color: rgba(10, 14, 39, 0.8);
+        border-radius: 8px;
+    }
+    
+    /* Image container with cyan border */
+    div[data-testid="stImage"] {
+        border: 2px solid #00ffff;
+        border-radius: 8px;
+        padding: 10px;
+        background-color: rgba(0, 0, 0, 0.3);
+        max-height: 540px;
+        overflow: hidden;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+    
+    /* Actual image styling - contained within border */
+    div[data-testid="stImage"] > img {
+        max-height: 500px;
+        max-width: 100%;
+        width: auto !important;
+        height: auto !important;
+        object-fit: contain;
+        display: block;
+        margin: 0 auto;
+    }
+    
+    /* Warning/error messages */
+    .stWarning, .stError {
+        text-align: center;
+        padding: 20px;
+        border-radius: 8px;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+## Live Data Streaming Functions
+
+def get_latest_stream_data() -> Optional[Dict]:
+    """
+    Get the latest aggregated data (camera, lidar, odom, status) from the backend's
+    internal stream buffer via the polling endpoint.
+    """
+    try:
+        # Uses the new polling endpoint added to app.py
+        response = requests.get(f"{BACKEND_URL}/api/latest_stream_data", timeout=0.5)
+        if response.status_code == 200:
+            return response.json()
+    except Exception:
+        # Silently fail for fast polling
+        pass
+    return None
+
+def process_camera_data(camera_data: Dict) -> Optional[np.ndarray]:
+    """
+    Process base64 image data from the aggregated stream message into a numpy array.
+    """
+    if camera_data and 'data' in camera_data and camera_data['data'] is not None:
+        try:
+            image_bytes = base64.b64decode(camera_data["data"])
+            img = Image.open(io.BytesIO(image_bytes))
+            # Convert PIL Image to numpy array (RGB format)
+            img_array = np.array(img)
+            # Ensure it's RGB
+            if len(img_array.shape) == 3 and img_array.shape[2] == 4:
+                img_array = img_array[:, :, :3]
+            return img_array
+        except Exception:
+            pass
+    return None
+
+# The rest of the API/Helper functions (get_status, start_recording, visualize_lidar, etc.) 
+# remain the same as they correctly target the FastAPI REST endpoints.
+
+def check_backend_connection() -> bool:
+    """Check if backend is available"""
+    try:
+        response = requests.get(f"{BACKEND_URL}/api/status", timeout=2) 
+        return response.status_code == 200
+    except:
+        return False
+
+def get_status() -> Optional[Dict]:
+    """Get system status from backend"""
+    try:
+        response = requests.get(f"{BACKEND_URL}/api/status", timeout=2)
+        if response.status_code == 200:
+            return response.json()
+    except Exception:
+        pass
+    return None
+
+def start_recording() -> bool:
+    """Start recording session"""
+    try:
+        response = requests.post(f"{BACKEND_URL}/api/recording/start", timeout=2)
+        return response.status_code == 200
+    except:
+        return False
+
+
+def stop_recording() -> bool:
+    """Stop recording session"""
+    try:
+        response = requests.post(f"{BACKEND_URL}/api/recording/stop", timeout=2)
+        return response.status_code == 200
+    except:
+        return False
+
+
+def list_recording_sessions() -> list:
+    """List all recording sessions"""
+    try:
+        response = requests.get(f"{BACKEND_URL}/api/recording/sessions", timeout=2)
+        if response.status_code == 200:
+            return response.json().get('sessions', [])
+    except:
+        pass
+    return []
+
+
+def get_session_data(session_id: str) -> Optional[Dict]:
+    """Get session metadata"""
+    try:
+        response = requests.get(f"{BACKEND_URL}/api/recording/session/{session_id}", timeout=2)
+        if response.status_code == 200:
+            return response.json()
+    except:
+        pass
+    return None
+
+
+def get_frame_from_session(session_id: str, frame_id: str) -> Optional[np.ndarray]:
+    """Get a specific frame from a session as numpy array (Replay mode)"""
+    try:
+        # This endpoint returns raw image bytes
+        response = requests.get(f"{BACKEND_URL}/api/recording/session/{session_id}/frame/{frame_id}", timeout=5)
+        if response.status_code == 200:
+            img = Image.open(io.BytesIO(response.content))
+            img_array = np.array(img)
+            if len(img_array.shape) == 3 and img_array.shape[2] == 4:
+                img_array = img_array[:, :, :3]
+            return img_array
+        if response.status_code == 404:
+            return None
+    except Exception:
+        pass
+    return None
+
+
+def get_lidar_from_session(session_id: str, frame_id: str) -> Optional[Dict]:
+    """Get LiDAR data for a specific frame from a session (Replay mode)"""
+    try:
+        response = requests.get(f"{BACKEND_URL}/api/recording/session/{session_id}/lidar/{frame_id}", timeout=2)
+        if response.status_code == 200:
+            return response.json()
+    except:
+        pass
+    return None
+
+def get_latest_map_image() -> Optional[Dict[str, Any]]:
+    """Get latest SLAM map image and metadata from backend (retained as it's a separate entity)."""
+    try:
+        response = requests.get(f"{BACKEND_URL}/api/map/latest", timeout=2)
+        if response.status_code == 200:
+            payload = response.json()
+            map_payload = payload.get("map")
+            if map_payload and map_payload.get("image"):
+                image_bytes = base64.b64decode(map_payload["image"])
+                image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+                map_payload["image_object"] = image
+                return map_payload
+    except:
+        pass
+    return None
+
+def visualize_lidar(lidar_data: Dict) -> go.Figure:
+    """Create LiDAR visualization"""
+    if not lidar_data or 'ranges' not in lidar_data or not lidar_data['ranges']:
+        return None
+    
+    data = lidar_data
+    ranges = np.array(data.get('ranges', []))
+    angles = np.array(data.get('angles', []))
+    
+    # Filter invalid ranges
+    valid_mask = (ranges > data.get('range_min', 0)) & (ranges < data.get('range_max', 30))
+    
+    # Apply filter to both arrays
+    angles = angles[valid_mask]
+    ranges = ranges[valid_mask]
+
+    
+    # Convert to Cartesian
+    x = ranges * np.cos(angles)
+    y = ranges * np.sin(angles)
+    
+    # Create scatter plot
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=x,
+        y=y,
+        mode='markers',
+        marker=dict(
+            size=3,
+            color=ranges,
+            colorscale='Viridis',
+            showscale=True,
+            colorbar=dict(title="Range (m)")
+        ),
+        name='LiDAR Scan'
+    ))
+    
+    # Add robot position (origin)
+    fig.add_trace(go.Scatter(
+        x=[0],
+        y=[0],
+        mode='markers',
+        marker=dict(size=15, color='cyan', symbol='circle'),
+        name='Robot'
+    ))
+    
+    fig.update_layout(
+        title="LiDAR Scan Visualization",
+        xaxis_title="X (m)",
+        yaxis_title="Y (m)",
+        template="plotly_dark",
+        height=500,
+        showlegend=True,
+        plot_bgcolor='#0a0e27',
+        paper_bgcolor='#0a0e27',
+        font=dict(color='#e0e0e0')
+    )
+    
+    # Set equal aspect ratio
+    fig.update_xaxes(scaleanchor="y", scaleratio=1, range=[-3, 3])
+    fig.update_yaxes(range=[-3, 3])
+    
+    return fig
+
+
+def visualize_odom(odom_data: Dict) -> Dict[str, float]:
+    """Extract odometry metrics"""
+    if not odom_data or 'position' not in odom_data:
+        return {}
+    
+    # Data is expected to be under 'data' key if fetched via API. 
+    # Since it's from stream_data, it's the raw dictionary.
+    data = odom_data 
+    pos = data.get('position', {})
+    vel = data.get('linear_velocity', {})
+    
+    # Assuming z-rotation (yaw) is not available in the simple odom data, 
+    # but still calculate position and speed.
+    
+    return {
+        'x': pos.get('x', 0),
+        'y': pos.get('y', 0),
+        'z': pos.get('z', 0),
+        'vx': vel.get('x', 0),
+        'vy': vel.get('y', 0),
+        'speed': np.sqrt(vel.get('x', 0)**2 + vel.get('y', 0)**2)
+    }
+
+# Initialize session state (retained from previous iteration)
+if 'recording' not in st.session_state:
+    st.session_state.recording = False
+if 'playback_mode' not in st.session_state:
+    st.session_state.playback_mode = False
+if 'selected_session' not in st.session_state:
+    st.session_state.selected_session = None
+if 'current_frame_idx' not in st.session_state:
+    st.session_state.current_frame_idx = 0
+if 'camera_enabled' not in st.session_state:
+    st.session_state.camera_enabled = True
+if 'lidar_enabled' not in st.session_state:
+    st.session_state.lidar_enabled = True
+if 'cached_session_data' not in st.session_state:
+    st.session_state.cached_session_data = {}
+if 'last_loaded_frame' not in st.session_state:
+    st.session_state.last_loaded_frame = None
+if 'cached_frames' not in st.session_state:
+    st.session_state.cached_frames = {}
+if 'failed_frames' not in st.session_state:
+    st.session_state.failed_frames = set()
+if 'enable_frame_cache' not in st.session_state:
+    st.session_state.enable_frame_cache = False
+
+
+# Main dashboard
+st.title("🤖 Yahboom Dashboard")
+st.markdown("---")
+
+# Sidebar controls
+with st.sidebar:
+    st.header("🎛️ Control Panel")
+    
+    # Backend status
+    backend_connected = check_backend_connection()
+    status_icon = "🟢" if backend_connected else "🔴"
+    st.markdown(f"**Backend Status:** {status_icon} {'Connected' if backend_connected else 'Disconnected'}")
+    
+    if not backend_connected:
+        st.error("⚠️ Cannot connect to backend. Please ensure the FastAPI server is running.")
+        st.stop()
+    
+    # Get system status
+    status = get_status()
+    
+    # Recording controls
+    st.subheader("📹 Recording")
+    recording_status = status.get('recording', False) if status else False
+    status_indicator = "🟢" if recording_status else "🟡"
+    st.markdown(f"**Status:** {status_indicator} {'Recording' if recording_status else 'Idle'}")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("▶️ Start", disabled=recording_status, use_container_width=True):
+            if start_recording():
+                st.success("Recording started")
+                st.rerun()
+    
+    with col2:
+        if st.button("⏹️ Stop", disabled=not recording_status, use_container_width=True):
+            if stop_recording():
+                st.success("Recording stopped")
+                st.rerun()
+    
+    # Display mode
+    st.subheader("🎬 Display Mode")
+    display_mode = st.radio(
+        "Mode",
+        ["Live", "Replay"],
+        index=0 if not st.session_state.playback_mode else 1,
+        label_visibility="collapsed"
+    )
+    st.session_state.playback_mode = (display_mode == "Replay")
+    
+    # Stream controls
+    st.subheader("📡 Stream Controls")
+    st.session_state.camera_enabled = st.checkbox("📷 Camera Feed", value=st.session_state.camera_enabled)
+    st.session_state.lidar_enabled = st.checkbox("📡 LiDAR/SLAM Map", value=st.session_state.lidar_enabled)
+    
+    # System metrics
+    if status:
+        st.subheader("📊 System Metrics")
+        # Note: Status check is now based on active topics, not just 'is_connected'
+        st.metric("ROS2", "🟢 Active" if status.get('ros2_connected') else "🔴 Inactive")
+        st.metric("Camera", "🟢 Active" if status.get('camera_available') else "🔴 Inactive")
+        st.metric("LiDAR", "🟢 Active" if status.get('lidar_available') else "🔴 Inactive")
+        st.metric("Map", "🟢 Active" if status.get('map_available') else "🔴 Inactive")
+        
+        if recording_status and status.get('recording_session'):
+            session_info = status['recording_session']
+            st.metric("Frames Recorded", f"{session_info.get('frame_count', 0):,}")
+            duration = session_info.get('duration', 0)
+            st.metric("Duration", f"{duration:.1f}s")
+
+
+# Main content area
+if st.session_state.playback_mode:
+    # --- Replay Mode (Retained) ---
+    st.header("📼 Replay Mode")
+    
+    # ... (Replay logic remains the same) ...
+    
+    # Simplified Replay Logic Placeholder (Full code should be used)
+    sessions = list_recording_sessions()
+    if sessions:
+        session_options = {s['session_id']: f"{s['session_id']} ({s['frame_count']} frames)"
+                              for s in sessions}
+        selected_session_id = st.selectbox(
+            "Select Recording Session",
+            options=list(session_options.keys()),
+            format_func=lambda x: session_options[x]
+        )
+        
+        if selected_session_id:
+            cache_key = f"session_{selected_session_id}"
+            if cache_key not in st.session_state.cached_session_data:
+                session_data = get_session_data(selected_session_id)
+                st.session_state.cached_session_data[cache_key] = session_data
+            else:
+                session_data = st.session_state.cached_session_data[cache_key]
+            
+            if st.session_state.selected_session != selected_session_id:
+                st.session_state.current_frame_idx = 0
+                st.session_state.selected_session = selected_session_id
+                st.session_state.last_loaded_frame = None
+                st.session_state.cached_frames = {}
+                st.session_state.failed_frames = set()
+            
+            if session_data and 'frames' in session_data:
+                frames = session_data['frames']
+                
+                if frames:
+                    st.subheader("⏱️ Timeline")
+                    max_idx = len(frames) - 1
+                    
+                    col_reset, col_cache, col_info = st.columns([1, 1, 2])
+                    with col_reset:
+                        if st.button("🔄 Reset", help="Reset to first frame and clear cache"):
+                            st.session_state.current_frame_idx = 0
+                            st.session_state.last_loaded_frame = None
+                            st.session_state.cached_frames = {}
+                            st.session_state.failed_frames = set()
+                            st.rerun()
+                    with col_cache:
+                        st.session_state.enable_frame_cache = st.checkbox(
+                            "💾 Cache Frames", 
+                            value=st.session_state.enable_frame_cache,
+                            help="Enable frame caching (uses more memory but faster navigation)"
+                        )
+                    
+                    frame_idx = st.slider(
+                        "Frame",
+                        0,
+                        max_idx,
+                        value=st.session_state.current_frame_idx,
+                        key="frame_slider"
+                    )
+                    st.session_state.current_frame_idx = frame_idx
+                    
+                    current_frame = frames[frame_idx]
+                    frame_time = datetime.fromtimestamp(current_frame['timestamp'])
+                    st.markdown(f"**Timestamp:** `{frame_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}` | **Frame:** {frame_idx + 1}/{len(frames)}")
+                    
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        if st.session_state.camera_enabled:
+                            st.subheader("📷 Camera Feed")
+                            frame_id = current_frame['frame_id']
+                            camera_placeholder = st.empty()
+                            
+                            frame_cache_key = f"{selected_session_id}_{frame_id}"
+                            frame_img = None
+                            
+                            if st.session_state.enable_frame_cache and frame_cache_key in st.session_state.cached_frames:
+                                frame_img = st.session_state.cached_frames[frame_cache_key]
+                            
+                            if frame_img is None:
+                                if frame_cache_key not in st.session_state.failed_frames:
+                                    try:
+                                        frame_img = get_frame_from_session(selected_session_id, frame_id)
+                                        if frame_img is not None:
+                                            if st.session_state.enable_frame_cache:
+                                                st.session_state.cached_frames[frame_cache_key] = frame_img
+                                            st.session_state.failed_frames.discard(frame_cache_key)
+                                        else:
+                                            st.session_state.failed_frames.add(frame_cache_key)
+                                    except Exception:
+                                        st.session_state.failed_frames.add(frame_cache_key)
+                            
+                            if frame_img is not None:
+                                camera_placeholder.image(frame_img, use_container_width=True)
+                            else:
+                                camera_placeholder.warning(f"⚠️ Frame {frame_id} not available or failed to load")
+                        else:
+                            st.info("Camera feed disabled")
+                    
+                    with col2:
+                        if st.session_state.lidar_enabled:
+                            st.subheader("📡 LiDAR/SLAM Map")
+                            lidar_placeholder = st.empty()
+                            
+                            try:
+                                frame_id = current_frame['frame_id']
+                                lidar_data = get_lidar_from_session(selected_session_id, frame_id)
+                                if lidar_data:
+                                    fig = visualize_lidar(lidar_data)
+                                    if fig:
+                                        lidar_placeholder.plotly_chart(fig, use_container_width=True)
+                                    else:
+                                        lidar_placeholder.warning("Could not visualize LiDAR data")
+                                else:
+                                    lidar_placeholder.warning("No LiDAR data for this frame")
+                            except Exception:
+                                lidar_placeholder.error("Error loading LiDAR data")
+                        else:
+                            st.info("LiDAR map disabled")
+                else:
+                    st.warning("No frames in this session")
+            else:
+                st.error("Could not load session data")
+    else:
+        st.info("No recording sessions available. Start recording to create sessions.")
+
+else:
+    # --- Live Mode (Updated for Polling and Stability) ---
+    st.header("🔴 Live Monitoring")
+    
+    # Fetch aggregated stream data once per rerun
+    stream_data = get_latest_stream_data()
+    
+    # Extract components
+    camera_data = stream_data.get('camera', {}) if stream_data else {}
+    lidar_data = stream_data.get('lidar', {}) if stream_data else {}
+    odom_data = stream_data.get('odom', {}) if stream_data else {}
+    
+    # Status bar
+    col1, col2, col3, col4, col5 = st.columns(5)
+    with col1:
+        is_recording = stream_data.get('recording', False) if stream_data else status.get('recording', False)
+        status_icon = "🟢 Recording" if is_recording else "🟡 Idle"
+        st.markdown(f"**Status:** {status_icon}")
+    with col2:
+        camera_status = "🟢" if camera_data.get('data') else "🔴"
+        st.markdown(f"**Camera:** {camera_status}")
+    with col3:
+        lidar_status = "🟢" if lidar_data else "🔴"
+        st.markdown(f"**LiDAR:** {lidar_status}")
+    with col4:
+        map_status = "🟢" if status.get('map_available') else "🔴"
+        st.markdown(f"**Map:** {map_status}")
+    with col5:
+        current_time = datetime.now().strftime("%H:%M:%S")
+        st.markdown(f"**Time:** `{current_time}`")
+    
+    # Main display area
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        if st.session_state.camera_enabled:
+            st.subheader("📷 Live Camera Feed")
+            
+            # Process and display latest frame from the aggregated stream data
+            camera_frame = process_camera_data(camera_data)
+            
+            # --- Display Logic ---
+            if camera_frame is not None:
+                # ✅ FIXED: Direct image display without custom HTML container
+                st.image(camera_frame, use_container_width=True)
+            else:
+                # 2. Frame missing: Display warning
+                st.warning("⚠️ NO CAMERA FEED AVAILABLE")
+            
+            # Timestamp below the image
+            frame_timestamp = camera_data.get('timestamp')
+            if frame_timestamp:
+                try:
+                    time_str = datetime.fromtimestamp(frame_timestamp).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+                    st.caption(f"🕐 {time_str}")
+                except:
+                    st.caption(f"🕐 Stream updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}")
+            else:
+                st.caption(f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}")
+
+        else:
+            st.info("📷 Camera feed disabled")
+    
+    with col2:
+        if st.session_state.lidar_enabled:
+            st.subheader("📡 LiDAR/SLAM Map")
+            map_tab, scan_tab = st.tabs(["SLAM Map", "Laser Scan"])
+            
+            with map_tab:
+                map_payload = get_latest_map_image()
+                if map_payload and map_payload.get("image_object"):
+                    st.image(map_payload["image_object"], use_container_width=True)
+                    resolution = map_payload.get("resolution")
+                    timestamp = map_payload.get("timestamp")
+                    if resolution:
+                        st.caption(f"🗺️ Resolution: {resolution:.2f} m/pixel")
+                    if timestamp:
+                        try:
+                            map_time = datetime.fromtimestamp(timestamp)
+                            st.caption(f"🕐 Map updated: {map_time.strftime('%Y-%m-%d %H:%M:%S')}")
+                        except Exception:
+                            pass
+                else:
+                    st.warning("⚠️ No SLAM map available")
+            
+            with scan_tab:
+                lidar_placeholder = st.empty()
+                if lidar_data:
+                    fig = visualize_lidar(lidar_data)
+                    if fig:
+                        lidar_placeholder.plotly_chart(fig, use_container_width=True)
+                    else:
+                        lidar_placeholder.warning("⚠️ Could not visualize LiDAR data")
+                else:
+                    lidar_placeholder.warning("⚠️ No LiDAR data available in stream")
+        else:
+            st.info("📡 LiDAR map disabled")
+    
+    # Odometry metrics
+    st.subheader("📊 Odometry")
+    if odom_data:
+        metrics = visualize_odom(odom_data)
+        if metrics:
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Position X", f"{metrics.get('x', 0):.2f} m")
+            with col2:
+                st.metric("Position Y", f"{metrics.get('y', 0):.2f} m")
+            with col3:
+                st.metric("Speed", f"{metrics.get('speed', 0):.2f} m/s")
+            with col4:
+                # Placeholder for heading calculation without full quaternion data
+                st.metric("Heading", f"N/A") 
+    else:
+        st.warning("⚠️ No odometry data available in stream")
+
+# Auto-refresh for live mode
+if not st.session_state.playback_mode:
+    time.sleep(REFRESH_INTERVAL)
+    st.rerun()
+# ========== ./frontend/backup/2-dashboard.py ==========
+"""
+Yahboom Dashboard - Streamlit Frontend
+Real-Time Robotic Control & Replay System
+"""
+# IMPORTANT: Configure logging BEFORE importing Streamlit
+import logging
+import warnings
+import sys
+
+# Suppress Streamlit media file storage warnings (harmless cache lookup errors)
+logging.getLogger('streamlit.runtime.media_file_storage').setLevel(logging.CRITICAL)
+logging.getLogger('streamlit.web.server.media_file_handler').setLevel(logging.CRITICAL)
+logging.getLogger('streamlit.runtime').setLevel(logging.ERROR)
+logging.getLogger('streamlit.web').setLevel(logging.ERROR)
+logging.getLogger('streamlit').setLevel(logging.ERROR)
+
+warnings.filterwarnings('ignore', category=UserWarning)
+warnings.filterwarnings('ignore', category=RuntimeWarning)
+
+# Create a filter to suppress MediaFileStorageError messages
+class MediaFileErrorFilter(logging.Filter):
+    def filter(self, record):
+        try:
+            msg = str(record.getMessage())
+            return not any([
+                'MediaFileStorageError' in msg,
+                'media_file_storage' in msg.lower(),
+                'media_file_handler' in msg.lower(),
+                'Bad filename' in msg,
+                'Missing file' in msg,
+                ('KeyError' in msg and 'media' in msg.lower())
+            ])
+        except:
+            return True
+
+# Apply filter to all relevant loggers
+for logger_name in ['streamlit', 'streamlit.runtime', 'streamlit.web', 'root']:
+    logger = logging.getLogger(logger_name if logger_name != 'root' else '')
+    logger.addFilter(MediaFileErrorFilter())
+    if logger_name != 'root':
+        logger.setLevel(logging.ERROR)
+
+# Now import Streamlit and other modules
+import streamlit as st
+import requests
+import json
+import time
+from datetime import datetime, timedelta
+from typing import Optional, Dict, Any
+import plotly.graph_objects as go
+import plotly.express as px
+import numpy as np
+from PIL import Image
+import io
+import base64
+
+# Configuration
+BACKEND_URL = "http://localhost:8000"
+REFRESH_INTERVAL = 0.033  # 33ms for smooth updates (30 FPS) - Optimized from 0.1
+
+# Page configuration
+st.set_page_config(
+    page_title="Yahboom Dashboard",
+    page_icon="🤖",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Custom CSS for dark technical theme and stability fix
+st.markdown("""
+<style>
+    /* Dark theme styling */
+    .main {
+        background-color: #0a0e27;
+        color: #e0e0e0;
+    }
+    
+    .stApp {
+        background: linear-gradient(180deg, #0a0e27 0%, #1a1f3a 100%);
+    }
+    
+    /* Camera feed container styling */
+    div[data-testid="column"] {
+        background-color: rgba(10, 14, 39, 0.8);
+        border-radius: 8px;
+    }
+    
+    /* Image container with cyan border */
+    div[data-testid="stImage"] {
+        border: 2px solid #00ffff;
+        border-radius: 8px;
+        padding: 10px;
+        background-color: rgba(0, 0, 0, 0.3);
+        max-height: 540px;
+        overflow: hidden;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+    
+    /* Actual image styling - contained within border */
+    div[data-testid="stImage"] > img {
+        max-height: 500px;
+        max-width: 100%;
+        width: auto !important;
+        height: auto !important;
+        object-fit: contain;
+        display: block;
+        margin: 0 auto;
+    }
+    
+    /* Warning/error messages */
+    .stWarning, .stError {
+        text-align: center;
+        padding: 20px;
+        border-radius: 8px;
+    }
+    
+    /* LiDAR/SLAM container with red outline */
+    div[data-testid="stVerticalBlock"]:has(div[data-testid="stPlotlyChart"]) {
+        border: 2px solid #ff0000;
+        border-radius: 8px;
+        padding: 10px;
+        background-color: rgba(0, 0, 0, 0.3);
+    }
+    
+    /* Plotly chart container styling */
+    div[data-testid="stPlotlyChart"] {
+        border-radius: 4px;
+    }
+    
+    /* Tabs styling for LiDAR/SLAM */
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 8px;
+    }
+    
+    .stTabs [data-baseweb="tab"] {
+        background-color: rgba(255, 255, 255, 0.05);
+        border-radius: 4px;
+        padding: 8px 16px;
+    }
+    
+    .stTabs [aria-selected="true"] {
+        background-color: rgba(255, 0, 0, 0.2);
+        border-bottom: 2px solid #ff0000;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+## Live Data Streaming Functions
+
+def get_latest_stream_data() -> Optional[Dict]:
+    """
+    Get the latest aggregated data (camera, lidar, odom, status) from the backend's
+    internal stream buffer via the polling endpoint.
+    """
+    try:
+        # Uses the new polling endpoint added to app.py
+        response = requests.get(f"{BACKEND_URL}/api/latest_stream_data", timeout=0.5)
+        if response.status_code == 200:
+            return response.json()
+    except Exception:
+        # Silently fail for fast polling
+        pass
+    return None
+
+def process_camera_data(camera_data: Dict) -> Optional[np.ndarray]:
+    """
+    Process base64 image data from the aggregated stream message into a numpy array.
+    """
+    if camera_data and 'data' in camera_data and camera_data['data'] is not None:
+        try:
+            image_bytes = base64.b64decode(camera_data["data"])
+            img = Image.open(io.BytesIO(image_bytes))
+            # Convert PIL Image to numpy array (RGB format)
+            img_array = np.array(img)
+            # Ensure it's RGB
+            if len(img_array.shape) == 3 and img_array.shape[2] == 4:
+                img_array = img_array[:, :, :3]
+            return img_array
+        except Exception:
+            pass
+    return None
+
+# The rest of the API/Helper functions (get_status, start_recording, visualize_lidar, etc.) 
+# remain the same as they correctly target the FastAPI REST endpoints.
+
+def check_backend_connection() -> bool:
+    """Check if backend is available"""
+    try:
+        response = requests.get(f"{BACKEND_URL}/api/status", timeout=2) 
+        return response.status_code == 200
+    except:
+        return False
+
+def get_status() -> Optional[Dict]:
+    """Get system status from backend"""
+    try:
+        response = requests.get(f"{BACKEND_URL}/api/status", timeout=2)
+        if response.status_code == 200:
+            return response.json()
+    except Exception:
+        pass
+    return None
+
+def start_recording() -> bool:
+    """Start recording session"""
+    try:
+        response = requests.post(f"{BACKEND_URL}/api/recording/start", timeout=2)
+        return response.status_code == 200
+    except:
+        return False
+
+
+def stop_recording() -> bool:
+    """Stop recording session"""
+    try:
+        response = requests.post(f"{BACKEND_URL}/api/recording/stop", timeout=2)
+        return response.status_code == 200
+    except:
+        return False
+
+
+def list_recording_sessions() -> list:
+    """List all recording sessions"""
+    try:
+        response = requests.get(f"{BACKEND_URL}/api/recording/sessions", timeout=2)
+        if response.status_code == 200:
+            return response.json().get('sessions', [])
+    except:
+        pass
+    return []
+
+
+def get_session_data(session_id: str) -> Optional[Dict]:
+    """Get session metadata"""
+    try:
+        response = requests.get(f"{BACKEND_URL}/api/recording/session/{session_id}", timeout=2)
+        if response.status_code == 200:
+            return response.json()
+    except:
+        pass
+    return None
+
+
+def get_frame_from_session(session_id: str, frame_id: str) -> Optional[np.ndarray]:
+    """Get a specific frame from a session as numpy array (Replay mode)"""
+    try:
+        # This endpoint returns raw image bytes
+        response = requests.get(f"{BACKEND_URL}/api/recording/session/{session_id}/frame/{frame_id}", timeout=5)
+        if response.status_code == 200:
+            img = Image.open(io.BytesIO(response.content))
+            img_array = np.array(img)
+            if len(img_array.shape) == 3 and img_array.shape[2] == 4:
+                img_array = img_array[:, :, :3]
+            return img_array
+        if response.status_code == 404:
+            return None
+    except Exception:
+        pass
+    return None
+
+
+def get_lidar_from_session(session_id: str, frame_id: str) -> Optional[Dict]:
+    """Get LiDAR data for a specific frame from a session (Replay mode)"""
+    try:
+        response = requests.get(f"{BACKEND_URL}/api/recording/session/{session_id}/lidar/{frame_id}", timeout=2)
+        if response.status_code == 200:
+            return response.json()
+    except:
+        pass
+    return None
+
+def get_latest_map_image() -> Optional[Dict[str, Any]]:
+    """Get latest SLAM map image and metadata from backend (retained as it's a separate entity)."""
+    try:
+        response = requests.get(f"{BACKEND_URL}/api/map/latest", timeout=2)
+        if response.status_code == 200:
+            payload = response.json()
+            map_payload = payload.get("map")
+            if map_payload and map_payload.get("image"):
+                image_bytes = base64.b64decode(map_payload["image"])
+                image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+                map_payload["image_object"] = image
+                return map_payload
+    except:
+        pass
+    return None
+
+def visualize_lidar(lidar_data: Dict) -> go.Figure:
+    """Create LiDAR visualization"""
+    if not lidar_data or 'ranges' not in lidar_data or not lidar_data['ranges']:
+        return None
+    
+    data = lidar_data
+    ranges = np.array(data.get('ranges', []))
+    angles = np.array(data.get('angles', []))
+    
+    # Filter invalid ranges
+    valid_mask = (ranges > data.get('range_min', 0)) & (ranges < data.get('range_max', 30))
+    
+    # Apply filter to both arrays
+    angles = angles[valid_mask]
+    ranges = ranges[valid_mask]
+
+    
+    # Convert to Cartesian
+    x = ranges * np.cos(angles)
+    y = ranges * np.sin(angles)
+    
+    # Create scatter plot
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=x,
+        y=y,
+        mode='markers',
+        marker=dict(
+            size=3,
+            color=ranges,
+            colorscale='Viridis',
+            showscale=True,
+            colorbar=dict(title="Range (m)")
+        ),
+        name='LiDAR Scan'
+    ))
+    
+    # Add robot position (origin)
+    fig.add_trace(go.Scatter(
+        x=[0],
+        y=[0],
+        mode='markers',
+        marker=dict(size=15, color='cyan', symbol='circle'),
+        name='Robot'
+    ))
+    
+    fig.update_layout(
+        title="LiDAR Scan Visualization",
+        xaxis_title="X (m)",
+        yaxis_title="Y (m)",
+        template="plotly_dark",
+        height=500,
+        showlegend=True,
+        plot_bgcolor='#0a0e27',
+        paper_bgcolor='#0a0e27',
+        font=dict(color='#e0e0e0')
+    )
+    
+    # Set equal aspect ratio
+    fig.update_xaxes(scaleanchor="y", scaleratio=1, range=[-3, 3])
+    fig.update_yaxes(range=[-3, 3])
+    
+    return fig
+
+
+def visualize_odom(odom_data: Dict) -> Dict[str, float]:
+    """Extract odometry metrics"""
+    if not odom_data or 'position' not in odom_data:
+        return {}
+    
+    # Data is expected to be under 'data' key if fetched via API. 
+    # Since it's from stream_data, it's the raw dictionary.
+    data = odom_data 
+    pos = data.get('position', {})
+    vel = data.get('linear_velocity', {})
+    
+    # Assuming z-rotation (yaw) is not available in the simple odom data, 
+    # but still calculate position and speed.
+    
+    return {
+        'x': pos.get('x', 0),
+        'y': pos.get('y', 0),
+        'z': pos.get('z', 0),
+        'vx': vel.get('x', 0),
+        'vy': vel.get('y', 0),
+        'speed': np.sqrt(vel.get('x', 0)**2 + vel.get('y', 0)**2)
+    }
+
+# Initialize session state (retained from previous iteration)
+if 'recording' not in st.session_state:
+    st.session_state.recording = False
+if 'playback_mode' not in st.session_state:
+    st.session_state.playback_mode = False
+if 'selected_session' not in st.session_state:
+    st.session_state.selected_session = None
+if 'current_frame_idx' not in st.session_state:
+    st.session_state.current_frame_idx = 0
+if 'camera_enabled' not in st.session_state:
+    st.session_state.camera_enabled = True
+if 'lidar_enabled' not in st.session_state:
+    st.session_state.lidar_enabled = True
+if 'cached_session_data' not in st.session_state:
+    st.session_state.cached_session_data = {}
+if 'last_loaded_frame' not in st.session_state:
+    st.session_state.last_loaded_frame = None
+if 'cached_frames' not in st.session_state:
+    st.session_state.cached_frames = {}
+if 'failed_frames' not in st.session_state:
+    st.session_state.failed_frames = set()
+if 'enable_frame_cache' not in st.session_state:
+    st.session_state.enable_frame_cache = False
+
+
+# Main dashboard
+st.title("🤖 Yahboom Dashboard")
+st.markdown("---")
+
+# Sidebar controls
+with st.sidebar:
+    st.header("🎛️ Control Panel")
+    
+    # Backend status
+    backend_connected = check_backend_connection()
+    status_icon = "🟢" if backend_connected else "🔴"
+    st.markdown(f"**Backend Status:** {status_icon} {'Connected' if backend_connected else 'Disconnected'}")
+    
+    if not backend_connected:
+        st.error("⚠️ Cannot connect to backend. Please ensure the FastAPI server is running.")
+        st.stop()
+    
+    # Get system status
+    status = get_status()
+    
+    # Recording controls
+    st.subheader("📹 Recording")
+    recording_status = status.get('recording', False) if status else False
+    status_indicator = "🟢" if recording_status else "🟡"
+    st.markdown(f"**Status:** {status_indicator} {'Recording' if recording_status else 'Idle'}")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("▶️ Start", disabled=recording_status, use_container_width=True):
+            if start_recording():
+                st.success("Recording started")
+                st.rerun()
+    
+    with col2:
+        if st.button("⏹️ Stop", disabled=not recording_status, use_container_width=True):
+            if stop_recording():
+                st.success("Recording stopped")
+                st.rerun()
+    
+    # Display mode
+    st.subheader("🎬 Display Mode")
+    display_mode = st.radio(
+        "Mode",
+        ["Live", "Replay"],
+        index=0 if not st.session_state.playback_mode else 1,
+        label_visibility="collapsed"
+    )
+    st.session_state.playback_mode = (display_mode == "Replay")
+    
+    # Stream controls
+    st.subheader("📡 Stream Controls")
+    st.session_state.camera_enabled = st.checkbox("📷 Camera Feed", value=st.session_state.camera_enabled)
+    st.session_state.lidar_enabled = st.checkbox("📡 LiDAR/SLAM Map", value=st.session_state.lidar_enabled)
+    
+    # System metrics
+    if status:
+        st.subheader("📊 System Metrics")
+        # Note: Status check is now based on active topics, not just 'is_connected'
+        st.metric("ROS2", "🟢 Active" if status.get('ros2_connected') else "🔴 Inactive")
+        st.metric("Camera", "🟢 Active" if status.get('camera_available') else "🔴 Inactive")
+        st.metric("LiDAR", "🟢 Active" if status.get('lidar_available') else "🔴 Inactive")
+        st.metric("Map", "🟢 Active" if status.get('map_available') else "🔴 Inactive")
+        
+        if recording_status and status.get('recording_session'):
+            session_info = status['recording_session']
+            st.metric("Frames Recorded", f"{session_info.get('frame_count', 0):,}")
+            duration = session_info.get('duration', 0)
+            st.metric("Duration", f"{duration:.1f}s")
+
+
+# Main content area
+if st.session_state.playback_mode:
+    # --- Replay Mode (Retained) ---
+    st.header("📼 Replay Mode")
+    
+    # ... (Replay logic remains the same) ...
+    
+    # Simplified Replay Logic Placeholder (Full code should be used)
+    sessions = list_recording_sessions()
+
+    # ⭐ ADD THE PRINT STATEMENT HERE ⭐
+    print(f"DEBUG: Sessions data returned by API: {sessions}", file=sys.stderr)
+
+    if sessions:
+        # FIX: Use 'sessions' variable and keys 'session_id', 'total_frames', and 'duration'
+        session_options = {s['session_id']: f"{s['session_id']} ({s.get('total_frames', 0)} frames, {s.get('duration', 0):.1f}s)"
+                           for s in sessions}
+        selected_session_id = st.selectbox(
+            "Select Recording Session",
+            options=list(session_options.keys()),
+            format_func=lambda x: session_options[x]
+        )
+        
+        if selected_session_id:
+            cache_key = f"session_{selected_session_id}"
+            if cache_key not in st.session_state.cached_session_data:
+                session_data = get_session_data(selected_session_id)
+                st.session_state.cached_session_data[cache_key] = session_data
+            else:
+                session_data = st.session_state.cached_session_data[cache_key]
+            
+            if st.session_state.selected_session != selected_session_id:
+                st.session_state.current_frame_idx = 0
+                st.session_state.selected_session = selected_session_id
+                st.session_state.last_loaded_frame = None
+                st.session_state.cached_frames = {}
+                st.session_state.failed_frames = set()
+            
+            if session_data and 'frames' in session_data:
+                frames = session_data['frames']
+                
+                if frames:
+                    st.subheader("⏱️ Timeline")
+                    max_idx = len(frames) - 1
+                    
+                    col_reset, col_cache, col_info = st.columns([1, 1, 2])
+                    with col_reset:
+                        if st.button("🔄 Reset", help="Reset to first frame and clear cache"):
+                            st.session_state.current_frame_idx = 0
+                            st.session_state.last_loaded_frame = None
+                            st.session_state.cached_frames = {}
+                            st.session_state.failed_frames = set()
+                            st.rerun()
+                    with col_cache:
+                        st.session_state.enable_frame_cache = st.checkbox(
+                            "💾 Cache Frames", 
+                            value=st.session_state.enable_frame_cache,
+                            help="Enable frame caching (uses more memory but faster navigation)"
+                        )
+                    
+                    frame_idx = st.slider(
+                        "Frame",
+                        0,
+                        max_idx,
+                        value=st.session_state.current_frame_idx,
+                        key="frame_slider"
+                    )
+                    st.session_state.current_frame_idx = frame_idx
+                    
+                    current_frame = frames[frame_idx]
+                    frame_time = datetime.fromtimestamp(current_frame['timestamp'])
+                    st.markdown(f"**Timestamp:** `{frame_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}` | **Frame:** {frame_idx + 1}/{len(frames)}")
+                    
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        if st.session_state.camera_enabled:
+                            st.subheader("📷 Camera Feed")
+                            frame_id = current_frame['frame_id']
+                            camera_placeholder = st.empty()
+                            
+                            frame_cache_key = f"{selected_session_id}_{frame_id}"
+                            frame_img = None
+                            
+                            if st.session_state.enable_frame_cache and frame_cache_key in st.session_state.cached_frames:
+                                frame_img = st.session_state.cached_frames[frame_cache_key]
+                            
+                            if frame_img is None:
+                                if frame_cache_key not in st.session_state.failed_frames:
+                                    try:
+                                        frame_img = get_frame_from_session(selected_session_id, frame_id)
+                                        if frame_img is not None:
+                                            if st.session_state.enable_frame_cache:
+                                                st.session_state.cached_frames[frame_cache_key] = frame_img
+                                            st.session_state.failed_frames.discard(frame_cache_key)
+                                        else:
+                                            st.session_state.failed_frames.add(frame_cache_key)
+                                    except Exception:
+                                        st.session_state.failed_frames.add(frame_cache_key)
+                            
+                            if frame_img is not None:
+                                camera_placeholder.image(frame_img, use_container_width=True)
+                            else:
+                                camera_placeholder.warning(f"⚠️ Frame {frame_id} not available or failed to load")
+                        else:
+                            st.info("Camera feed disabled")
+                    
+                    with col2:
+                        if st.session_state.lidar_enabled:
+                            st.subheader("📡 LiDAR/SLAM Map")
+                            lidar_placeholder = st.empty()
+                            
+                            try:
+                                frame_id = current_frame['frame_id']
+                                lidar_data = get_lidar_from_session(selected_session_id, frame_id)
+                                if lidar_data:
+                                    fig = visualize_lidar(lidar_data)
+                                    if fig:
+                                        lidar_placeholder.plotly_chart(fig, use_container_width=True)
+                                    else:
+                                        lidar_placeholder.warning("Could not visualize LiDAR data")
+                                else:
+                                    lidar_placeholder.warning("No LiDAR data for this frame")
+                            except Exception:
+                                lidar_placeholder.error("Error loading LiDAR data")
+                        else:
+                            st.info("LiDAR map disabled")
+                else:
+                    st.warning("No frames in this session")
+            else:
+                st.error("Could not load session data")
+    else:
+        st.info("No recording sessions available. Start recording to create sessions.")
+
+else:
+    # --- Live Mode (Updated for Polling and Stability) ---
+    st.header("🔴 Live Monitoring")
+    
+    # Fetch aggregated stream data once per rerun
+    stream_data = get_latest_stream_data()
+    
+    # Extract components
+    camera_data = stream_data.get('camera', {}) if stream_data else {}
+    lidar_data = stream_data.get('lidar', {}) if stream_data else {}
+    odom_data = stream_data.get('odom', {}) if stream_data else {}
+    
+    # Status bar
+    col1, col2, col3, col4, col5 = st.columns(5)
+    with col1:
+        is_recording = stream_data.get('recording', False) if stream_data else status.get('recording', False)
+        status_icon = "🟢 Recording" if is_recording else "🟡 Idle"
+        st.markdown(f"**Status:** {status_icon}")
+    with col2:
+        camera_status = "🟢" if camera_data.get('data') else "🔴"
+        st.markdown(f"**Camera:** {camera_status}")
+    with col3:
+        lidar_status = "🟢" if lidar_data else "🔴"
+        st.markdown(f"**LiDAR:** {lidar_status}")
+    with col4:
+        map_status = "🟢" if status.get('map_available') else "🔴"
+        st.markdown(f"**Map:** {map_status}")
+    with col5:
+        current_time = datetime.now().strftime("%H:%M:%S")
+        st.markdown(f"**Time:** `{current_time}`")
+    
+    # Main display area
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        if st.session_state.camera_enabled:
+            st.subheader("📷 Live Camera Feed")
+            
+            # Process and display latest frame from the aggregated stream data
+            camera_frame = process_camera_data(camera_data)
+            
+            # --- Display Logic ---
+            if camera_frame is not None:
+                # ✅ FIXED: Direct image display without custom HTML container
+                st.image(camera_frame, use_container_width=True)
+            else:
+                # 2. Frame missing: Display warning
+                st.warning("⚠️ NO CAMERA FEED AVAILABLE")
+            
+            # Timestamp below the image
+            frame_timestamp = camera_data.get('timestamp')
+            if frame_timestamp:
+                try:
+                    time_str = datetime.fromtimestamp(frame_timestamp).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+                    st.caption(f"🕐 {time_str}")
+                except:
+                    st.caption(f"🕐 Stream updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}")
+            else:
+                st.caption(f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}")
+
+        else:
+            st.info("📷 Camera feed disabled")
+    
+    with col2:
+        if st.session_state.lidar_enabled:
+            st.subheader("📡 LiDAR/SLAM Map")
+            # ✅ SWAPPED: Laser Scan first, SLAM Map second
+            scan_tab, map_tab = st.tabs(["🔴 Laser Scan", "🗺️ SLAM Map"])
+            
+            with scan_tab:
+                # LiDAR Laser Scan visualization
+                if lidar_data:
+                    fig = visualize_lidar(lidar_data)
+                    if fig:
+                        st.plotly_chart(fig, use_container_width=True)
+                    else:
+                        st.warning("⚠️ Could not visualize LiDAR data")
+                else:
+                    st.warning("⚠️ No LiDAR data available in stream")
+            
+            with map_tab:
+                # SLAM Map visualization
+                map_payload = get_latest_map_image()
+                if map_payload and map_payload.get("image_object"):
+                    st.image(map_payload["image_object"], use_container_width=True)
+                    resolution = map_payload.get("resolution")
+                    timestamp = map_payload.get("timestamp")
+                    if resolution:
+                        st.caption(f"🗺️ Resolution: {resolution:.2f} m/pixel")
+                    if timestamp:
+                        try:
+                            map_time = datetime.fromtimestamp(timestamp)
+                            st.caption(f"🕐 Map updated: {map_time.strftime('%Y-%m-%d %H:%M:%S')}")
+                        except Exception:
+                            pass
+                else:
+                    st.warning("⚠️ No SLAM map available")
+        else:
+            st.info("📡 LiDAR map disabled")
+    
+    # 🚧 Odometry metrics - TO BE ENHANCED LATER
+    # The robot has: tf, odom, imu, map, scan topics available
+    # Future enhancement: Full odometry visualization with trajectory, IMU data, etc.
+    st.subheader("📊 Odometry (Basic)")
+    if odom_data:
+        metrics = visualize_odom(odom_data)
+        if metrics:
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Position X", f"{metrics.get('x', 0):.2f} m")
+            with col2:
+                st.metric("Position Y", f"{metrics.get('y', 0):.2f} m")
+            with col3:
+                st.metric("Speed", f"{metrics.get('speed', 0):.2f} m/s")
+            with col4:
+                # 🚧 TODO: Add heading from IMU/TF data
+                st.metric("Heading", f"N/A") 
+    else:
+        st.info("ℹ️ Odometry visualization will be enhanced in next version")
+
+# Auto-refresh for live mode
+if not st.session_state.playback_mode:
+    time.sleep(REFRESH_INTERVAL)
+    st.rerun()
+

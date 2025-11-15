@@ -1,16 +1,16 @@
 ros2:
   topics:
-    camera: "/camera/image_raw"
+    camera: "/camera/raw_image"
     lidar: "/scan"
     odom: "/odom"
     map: "/map"
 
 camera:
   enabled: true
-  device: "/dev/video0"
+  video_source: "/dev/video0"
   width: 640
   height: 480
-  fps: 30
+  fps: 30  # Optimized from 60 (reduced for stability)
   
 recording:
   storage_path: "recordings"
@@ -19,15 +19,14 @@ recording:
   sync_interval_ms: 100
 
 streaming:
-  image_quality: 85
-  max_fps: 30
+  image_quality: 60  # Optimized from 85 (faster encoding)
+  max_fps: 30  # Kept at 30 for smooth video
   websocket_port: 8765
 
 dashboard:
-  refresh_rate_ms: 100
+  refresh_rate_ms: 33  # Optimized from 100 (30 FPS instead of 10 FPS)
   max_history_hours: 24
 
 alerts:
   enabled: true
   anomaly_threshold: 0.7
-

@@ -56,7 +56,7 @@ import base64
 
 # Configuration
 BACKEND_URL = "http://localhost:8000"
-REFRESH_INTERVAL = 0.033  # 33ms for smooth updates (30 FPS) - Optimized from 0.1
+REFRESH_INTERVAL = 0.1  # 100ms for smooth updates (10 FPS)
 
 # Page configuration
 st.set_page_config(
@@ -114,51 +114,6 @@ st.markdown("""
         text-align: center;
         padding: 20px;
         border-radius: 8px;
-    }
-    
-    /* LiDAR/SLAM container with red outline */
-    div[data-testid="stVerticalBlock"]:has(div[data-testid="stPlotlyChart"]) {
-        border: 2px solid #ff0000;
-        border-radius: 8px;
-        padding: 10px;
-        background-color: rgba(0, 0, 0, 0.3);
-    }
-    
-    /* Plotly chart container styling */
-    div[data-testid="stPlotlyChart"] {
-        border-radius: 4px;
-    }
-    
-    /* Tabs styling for LiDAR/SLAM */
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 8px;
-    }
-    
-    .stTabs [data-baseweb="tab"] {
-        background-color: rgba(255, 255, 255, 0.05);
-        border-radius: 4px;
-        padding: 8px 16px;
-    }
-    
-    .stTabs [aria-selected="true"] {
-        background-color: rgba(255, 0, 0, 0.2);
-        border-bottom: 2px solid #ff0000;
-    }
-    
-    /* ALERT Button styling */
-    button[kind="primary"] {
-        background-color: #ff0000 !important;
-        color: white !important;
-        font-weight: bold !important;
-        font-size: 18px !important;
-        padding: 12px !important;
-        border: 2px solid #ff4444 !important;
-        box-shadow: 0 0 10px rgba(255, 0, 0, 0.5) !important;
-    }
-    
-    button[kind="primary"]:hover {
-        background-color: #cc0000 !important;
-        box-shadow: 0 0 20px rgba(255, 0, 0, 0.8) !important;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -232,23 +187,6 @@ def stop_recording() -> bool:
     """Stop recording session"""
     try:
         response = requests.post(f"{BACKEND_URL}/api/recording/stop", timeout=2)
-        return response.status_code == 200
-    except:
-        return False
-
-
-def add_alert(description: str = "", alert_type: str = "manual") -> bool:
-    """Add alert to current recording"""
-    try:
-        response = requests.post(
-            f"{BACKEND_URL}/api/recording/alert",
-            json={
-                "type": alert_type,
-                "description": description,
-                "metadata": {}
-            },
-            timeout=2
-        )
         return response.status_code == 200
     except:
         return False
@@ -512,14 +450,9 @@ if st.session_state.playback_mode:
     
     # Simplified Replay Logic Placeholder (Full code should be used)
     sessions = list_recording_sessions()
-
-    # ⭐ ADD THE PRINT STATEMENT HERE ⭐
-    print(f"DEBUG: Sessions data returned by API: {sessions}", file=sys.stderr)
-
     if sessions:
-        # FIX: Use 'sessions' variable and keys 'session_id', 'total_frames', and 'duration'
-        session_options = {s['session_id']: f"{s['session_id']} ({s.get('total_frames', 0)} frames, {s.get('duration', 0):.1f}s)"
-                           for s in sessions}
+        session_options = {s['session_id']: f"{s['session_id']} ({s['frame_count']} frames)"
+                              for s in sessions}
         selected_session_id = st.selectbox(
             "Select Recording Session",
             options=list(session_options.keys()),
@@ -541,21 +474,8 @@ if st.session_state.playback_mode:
                 st.session_state.cached_frames = {}
                 st.session_state.failed_frames = set()
             
-            if session_data:
-                # Generate frames list from total_frames (API returns total_frames, not frames array)
-                total_frames = session_data.get('total_frames', 0)
-                if total_frames > 0:
-                    # Create list of frame dictionaries matching the expected format
-                    # Frame files are named: frame_000001.jpg, frame_000002.jpg, etc.
-                    frames = [
-                        {
-                            'frame_id': f"frame_{i:06d}",
-                            'timestamp': session_data.get('start_time', 0) + (i-1) * (session_data.get('duration', 0) / total_frames)
-                        }
-                        for i in range(1, total_frames + 1)
-                    ]
-                else:
-                    frames = []
+            if session_data and 'frames' in session_data:
+                frames = session_data['frames']
                 
                 if frames:
                     st.subheader("⏱️ Timeline")
@@ -709,17 +629,6 @@ else:
                     st.caption(f"🕐 Stream updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}")
             else:
                 st.caption(f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}")
-            
-            # ALERT Button (only visible when recording)
-            if recording_status:
-                st.markdown("<br>", unsafe_allow_html=True)
-                if st.button("🚨 ALERT", type="primary", use_container_width=True, key="alert_button"):
-                    if add_alert(description="Manual alert from dashboard"):
-                        st.success("✅ Alert added!")
-                        time.sleep(0.5)
-                        st.rerun()
-                    else:
-                        st.error("❌ Failed to add alert")
 
         else:
             st.info("📷 Camera feed disabled")
@@ -727,22 +636,9 @@ else:
     with col2:
         if st.session_state.lidar_enabled:
             st.subheader("📡 LiDAR/SLAM Map")
-            # ✅ SWAPPED: Laser Scan first, SLAM Map second
-            scan_tab, map_tab = st.tabs(["🔴 Laser Scan", "🗺️ SLAM Map"])
-            
-            with scan_tab:
-                # LiDAR Laser Scan visualization
-                if lidar_data:
-                    fig = visualize_lidar(lidar_data)
-                    if fig:
-                        st.plotly_chart(fig, use_container_width=True)
-                    else:
-                        st.warning("⚠️ Could not visualize LiDAR data")
-                else:
-                    st.warning("⚠️ No LiDAR data available in stream")
+            map_tab, scan_tab = st.tabs(["SLAM Map", "Laser Scan"])
             
             with map_tab:
-                # SLAM Map visualization
                 map_payload = get_latest_map_image()
                 if map_payload and map_payload.get("image_object"):
                     st.image(map_payload["image_object"], use_container_width=True)
@@ -758,13 +654,22 @@ else:
                             pass
                 else:
                     st.warning("⚠️ No SLAM map available")
+            
+            with scan_tab:
+                lidar_placeholder = st.empty()
+                if lidar_data:
+                    fig = visualize_lidar(lidar_data)
+                    if fig:
+                        lidar_placeholder.plotly_chart(fig, use_container_width=True)
+                    else:
+                        lidar_placeholder.warning("⚠️ Could not visualize LiDAR data")
+                else:
+                    lidar_placeholder.warning("⚠️ No LiDAR data available in stream")
         else:
             st.info("📡 LiDAR map disabled")
     
-    # 🚧 Odometry metrics - TO BE ENHANCED LATER
-    # The robot has: tf, odom, imu, map, scan topics available
-    # Future enhancement: Full odometry visualization with trajectory, IMU data, etc.
-    st.subheader("📊 Odometry (Basic)")
+    # Odometry metrics
+    st.subheader("📊 Odometry")
     if odom_data:
         metrics = visualize_odom(odom_data)
         if metrics:
@@ -776,10 +681,10 @@ else:
             with col3:
                 st.metric("Speed", f"{metrics.get('speed', 0):.2f} m/s")
             with col4:
-                # 🚧 TODO: Add heading from IMU/TF data
+                # Placeholder for heading calculation without full quaternion data
                 st.metric("Heading", f"N/A") 
     else:
-        st.info("ℹ️ Odometry visualization will be enhanced in next version")
+        st.warning("⚠️ No odometry data available in stream")
 
 # Auto-refresh for live mode
 if not st.session_state.playback_mode:

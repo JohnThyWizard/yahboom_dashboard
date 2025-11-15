@@ -144,22 +144,6 @@ st.markdown("""
         background-color: rgba(255, 0, 0, 0.2);
         border-bottom: 2px solid #ff0000;
     }
-    
-    /* ALERT Button styling */
-    button[kind="primary"] {
-        background-color: #ff0000 !important;
-        color: white !important;
-        font-weight: bold !important;
-        font-size: 18px !important;
-        padding: 12px !important;
-        border: 2px solid #ff4444 !important;
-        box-shadow: 0 0 10px rgba(255, 0, 0, 0.5) !important;
-    }
-    
-    button[kind="primary"]:hover {
-        background-color: #cc0000 !important;
-        box-shadow: 0 0 20px rgba(255, 0, 0, 0.8) !important;
-    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -232,23 +216,6 @@ def stop_recording() -> bool:
     """Stop recording session"""
     try:
         response = requests.post(f"{BACKEND_URL}/api/recording/stop", timeout=2)
-        return response.status_code == 200
-    except:
-        return False
-
-
-def add_alert(description: str = "", alert_type: str = "manual") -> bool:
-    """Add alert to current recording"""
-    try:
-        response = requests.post(
-            f"{BACKEND_URL}/api/recording/alert",
-            json={
-                "type": alert_type,
-                "description": description,
-                "metadata": {}
-            },
-            timeout=2
-        )
         return response.status_code == 200
     except:
         return False
@@ -541,21 +508,8 @@ if st.session_state.playback_mode:
                 st.session_state.cached_frames = {}
                 st.session_state.failed_frames = set()
             
-            if session_data:
-                # Generate frames list from total_frames (API returns total_frames, not frames array)
-                total_frames = session_data.get('total_frames', 0)
-                if total_frames > 0:
-                    # Create list of frame dictionaries matching the expected format
-                    # Frame files are named: frame_000001.jpg, frame_000002.jpg, etc.
-                    frames = [
-                        {
-                            'frame_id': f"frame_{i:06d}",
-                            'timestamp': session_data.get('start_time', 0) + (i-1) * (session_data.get('duration', 0) / total_frames)
-                        }
-                        for i in range(1, total_frames + 1)
-                    ]
-                else:
-                    frames = []
+            if session_data and 'frames' in session_data:
+                frames = session_data['frames']
                 
                 if frames:
                     st.subheader("⏱️ Timeline")
@@ -709,17 +663,6 @@ else:
                     st.caption(f"🕐 Stream updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}")
             else:
                 st.caption(f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}")
-            
-            # ALERT Button (only visible when recording)
-            if recording_status:
-                st.markdown("<br>", unsafe_allow_html=True)
-                if st.button("🚨 ALERT", type="primary", use_container_width=True, key="alert_button"):
-                    if add_alert(description="Manual alert from dashboard"):
-                        st.success("✅ Alert added!")
-                        time.sleep(0.5)
-                        st.rerun()
-                    else:
-                        st.error("❌ Failed to add alert")
 
         else:
             st.info("📷 Camera feed disabled")

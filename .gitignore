@@ -72,3 +72,9 @@ htmlcov/
 *.tmp
 *.bak
 *.cache
+
+# ZIPS
+*.zip
+
+# OTHER
+mqtt-camera-streamer/
