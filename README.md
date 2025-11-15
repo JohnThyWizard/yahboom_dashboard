@@ -1,4 +1,4 @@
-# Yahboom Dashboard (READ DISCLAIMER)
+# Yahboom Dashboard
 
 Real-Time Robotic Control & Replay System
 
